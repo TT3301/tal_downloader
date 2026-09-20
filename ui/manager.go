@@ -21,7 +21,7 @@ type Manager struct {
 	apiClient            *api.Client
 	downloader           *downloader.Downloader
 	selectedCourses      []*models.Course
-	selectedLectures     map[string][]int // courseID -> selected lecture indices
+	selectedLectures     map[string][]*models.Lecture
 	downloadPath         string
 	isExtensive          bool
 	isOverwrite          bool
@@ -36,7 +36,7 @@ func NewManager(window fyne.Window, mainContainer *fyne.Container) *Manager {
 		mainContainer:        mainContainer,
 		apiClient:            api.NewClient(),
 		downloader:           downloader.NewDownloader(config.MaxConcurrentDownloads, config.ThreadCount),
-		selectedLectures:     make(map[string][]int),
+		selectedLectures:     make(map[string][]*models.Lecture),
 		currentScreen:        "login",
 		isConfirmScreenShown: false,
 		isSaveUserInfo:       false,

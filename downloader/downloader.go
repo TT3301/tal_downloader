@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +36,7 @@ type DownloadTask struct {
 	// 状态相关
 	statusMutex sync.RWMutex
 	status      string
+	errorMutex  sync.RWMutex
 }
 
 // Status getter and setter methods for thread safety
@@ -52,10 +52,32 @@ func (task *DownloadTask) SetStatus(status string) {
 	task.status = status
 }
 
+func (task *DownloadTask) setError(err error) {
+	if err == nil {
+		return
+	}
+	task.errorMutex.Lock()
+	defer task.errorMutex.Unlock()
+	if task.Error == nil {
+		task.Error = err
+	}
+}
+
+func (task *DownloadTask) getError() error {
+	task.errorMutex.RLock()
+	defer task.errorMutex.RUnlock()
+	return task.Error
+}
+
+func (task *DownloadTask) clearError() {
+	task.errorMutex.Lock()
+	task.Error = nil
+	task.errorMutex.Unlock()
+}
+
 type ProgressManager struct {
 	tasks      map[*DownloadTask]bool
 	tasksMutex sync.RWMutex
-	ticker     *time.Ticker
 	stopChan   chan struct{}
 	started    bool
 	startMutex sync.Mutex // 保护started字段
@@ -63,8 +85,7 @@ type ProgressManager struct {
 
 func NewProgressManager() *ProgressManager {
 	return &ProgressManager{
-		tasks:    make(map[*DownloadTask]bool),
-		stopChan: make(chan struct{}),
+		tasks: make(map[*DownloadTask]bool),
 	}
 }
 
@@ -83,11 +104,13 @@ func (pm *ProgressManager) AddTask(task *DownloadTask) {
 	shouldStart := !pm.started
 	if shouldStart {
 		pm.started = true
+		pm.stopChan = make(chan struct{})
 	}
+	stopChan := pm.stopChan
 	pm.startMutex.Unlock()
 
 	if shouldStart {
-		pm.start()
+		pm.start(stopChan)
 	}
 }
 
@@ -101,42 +124,25 @@ func (pm *ProgressManager) RemoveTask(task *DownloadTask) {
 	shouldStop := len(pm.tasks) == 0 && pm.started
 	if shouldStop {
 		pm.started = false
+		close(pm.stopChan)
 	}
 	pm.startMutex.Unlock()
-
-	if shouldStop {
-		pm.stop()
-	}
 }
 
-func (pm *ProgressManager) start() {
-	pm.ticker = time.NewTicker(100 * time.Millisecond)
+func (pm *ProgressManager) start(stopChan <-chan struct{}) {
+	ticker := time.NewTicker(100 * time.Millisecond)
 
 	go func() {
-		defer pm.ticker.Stop()
+		defer ticker.Stop()
 		for {
 			select {
-			case <-pm.ticker.C:
+			case <-ticker.C:
 				pm.updateAllTasks()
-			case <-pm.stopChan:
+			case <-stopChan:
 				return
 			}
 		}
 	}()
-}
-
-func (pm *ProgressManager) stop() {
-	// 创建新的stopChan来避免重复关闭问题
-	pm.startMutex.Lock()
-	oldStopChan := pm.stopChan
-	pm.stopChan = make(chan struct{})
-	pm.startMutex.Unlock()
-
-	// 通知停止（非阻塞）
-	select {
-	case oldStopChan <- struct{}{}:
-	default:
-	}
 }
 
 func (pm *ProgressManager) updateAllTasks() {
@@ -268,58 +274,119 @@ func (d *Downloader) AddTask(url, filePath string, progressFunc func(float64, st
 }
 
 func (d *Downloader) Start() {
-	semaphore := make(chan struct{}, d.concurrentFiles)
+	d.mu.Lock()
+	pendingTasks := append([]*DownloadTask(nil), d.tasks...)
+	d.tasks = nil
+	d.mu.Unlock()
 
-	for _, task := range d.tasks {
-		task.wg.Add(1)
-		go func(t *DownloadTask) {
-			defer t.wg.Done()
+	concurrentFiles := d.concurrentFiles
+	if concurrentFiles < 1 {
+		concurrentFiles = 1
+	}
+	semaphore := make(chan struct{}, concurrentFiles)
+
+	for _, task := range pendingTasks {
+		d.startTask(task, semaphore)
+	}
+}
+
+func (d *Downloader) startTask(task *DownloadTask, semaphore chan struct{}) {
+	task.wg.Add(1)
+	go func(t *DownloadTask) {
+		defer t.wg.Done()
+		if semaphore != nil {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
-			if err := d.downloadFile(t); err != nil {
-				t.Error = err
-				t.SetStatus("error")
-				if t.progress != nil {
-					t.progress(0, fmt.Sprintf("错误： %v", err), -1, -1)
-				}
+		}
+		if err := d.downloadFile(t); err != nil {
+			t.setError(err)
+			t.SetStatus("error")
+			if t.progress != nil {
+				t.progress(0, fmt.Sprintf("错误： %v", err), -1, -1)
 			}
-		}(task)
+		}
+	}(task)
+}
+
+// Retry restarts a failed task. Resume only controls a live paused request and
+// cannot revive a goroutine that has already returned with an error.
+func (d *Downloader) Retry(task *DownloadTask) error {
+	if task == nil {
+		return fmt.Errorf("下载任务为空")
 	}
+
+	task.statusMutex.Lock()
+	if task.status != "error" {
+		status := task.status
+		task.statusMutex.Unlock()
+		return fmt.Errorf("只有失败任务可以重试，当前状态：%s", status)
+	}
+	task.status = "pending"
+	task.statusMutex.Unlock()
+
+	task.clearError()
+	task.isPaused.Store(false)
+	atomic.StoreInt64(&task.Downloaded, 0)
+	atomic.StoreInt64(&task.DownloadedParts, 0)
+	d.startTask(task, nil)
+	return nil
 }
 
 func (d *Downloader) downloadRegularFile(task *DownloadTask) error {
 	task.SetStatus("preparing")
 	task.StartTime = time.Now()
+	atomic.StoreInt64(&task.Downloaded, 0)
+	task.clearError()
 
 	// 创建目录
 	if err := utils.Mkdir(filepath.Dir(task.FilePath)); err != nil {
 		return err
 	}
 
-	// HEAD 请求判断是否支持 Range
-	req, err := http.NewRequest("HEAD", task.URL, nil)
+	supportsRange, totalSize, err := d.probeRegularFile(task.URL)
 	if err != nil {
 		return err
 	}
-	resp, err := d.client.Do(req)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
+	task.TotalSize = totalSize
 
-	supportsRange := strings.ToLower(resp.Header.Get("Accept-Ranges")) == "bytes"
-	if !supportsRange {
-		// 回退到单线程下载
-		task.TotalSize = -1 // 标记为未知大小
+	if !supportsRange || totalSize <= 0 || d.perFileThreads <= 1 {
 		return d.downloadSingleThread(task)
 	}
-	sizeStr := resp.Header.Get("Content-Length")
-	if sizeStr == "" {
-		return fmt.Errorf("Content-Length not provided")
-	}
-	task.TotalSize, _ = strconv.ParseInt(sizeStr, 10, 64)
 
 	return d.downloadMultiThread(task)
+}
+
+func (d *Downloader) probeRegularFile(rawURL string) (bool, int64, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return false, 0, err
+	}
+	req.Header.Set("Range", "bytes=0-0")
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return false, 0, err
+	}
+	defer resp.Body.Close()
+
+	if err := validateMediaResponse(resp); err != nil {
+		return false, 0, err
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		start, end, total, err := parseContentRange(resp.Header.Get("Content-Range"))
+		if err != nil || start != 0 || end != 0 || total <= 0 {
+			return false, 0, fmt.Errorf("服务器返回了无效的 Content-Range: %q", resp.Header.Get("Content-Range"))
+		}
+		return true, total, nil
+	}
+	if resp.StatusCode == http.StatusOK {
+		total := resp.ContentLength
+		if total < 0 {
+			total = 0
+		}
+		return false, total, nil
+	}
+	return false, 0, fmt.Errorf("视频探测失败：HTTP %d", resp.StatusCode)
 }
 
 func (d *Downloader) downloadMultiThread(task *DownloadTask) error {
@@ -327,14 +394,27 @@ func (d *Downloader) downloadMultiThread(task *DownloadTask) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	succeeded := false
+	defer func() {
+		_ = file.Close()
+		if !succeeded {
+			_ = utils.RemoveFile(task.FilePath)
+		}
+	}()
 
 	// 预分配文件大小
 	if err := file.Truncate(task.TotalSize); err != nil {
 		return err
 	}
 
-	partSize := task.TotalSize / int64(d.perFileThreads)
+	threadCount := d.perFileThreads
+	if int64(threadCount) > task.TotalSize {
+		threadCount = int(task.TotalSize)
+	}
+	if threadCount < 1 {
+		return fmt.Errorf("视频大小无效：%d", task.TotalSize)
+	}
+	partSize := task.TotalSize / int64(threadCount)
 	var wg sync.WaitGroup
 
 	task.SetStatus("downloading")
@@ -343,52 +423,79 @@ func (d *Downloader) downloadMultiThread(task *DownloadTask) error {
 	d.progressManager.AddTask(task)
 	defer d.progressManager.RemoveTask(task)
 
-	for i := 0; i < d.perFileThreads; i++ {
+	for i := 0; i < threadCount; i++ {
 		wg.Add(1)
 		start := int64(i) * partSize
 		end := start + partSize - 1
-		if i == d.perFileThreads-1 {
+		if i == threadCount-1 {
 			end = task.TotalSize - 1
 		}
 
 		go func(start, end int64) {
 			defer wg.Done()
+			if task.getError() != nil {
+				return
+			}
 			req, err := http.NewRequest("GET", task.URL, nil)
 			if err != nil {
-				task.Error = err
+				task.setError(err)
 				return
 			}
 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
 			resp, err := d.client.Do(req)
 			if err != nil {
-				task.Error = err
+				task.setError(err)
 				return
 			}
 			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusPartialContent {
+				task.setError(fmt.Errorf("服务器未按 Range 返回分片：HTTP %d", resp.StatusCode))
+				return
+			}
+			responseStart, responseEnd, total, err := parseContentRange(resp.Header.Get("Content-Range"))
+			if err != nil || responseStart != start || responseEnd != end || total != task.TotalSize {
+				task.setError(fmt.Errorf("分片范围不匹配：请求 %d-%d，返回 %q", start, end,
+					resp.Header.Get("Content-Range")))
+				return
+			}
+			if err := validateMediaResponse(resp); err != nil {
+				task.setError(err)
+				return
+			}
 
 			buf := make([]byte, 32*1024)
 			offset := start
 			for {
+				if task.getError() != nil {
+					return
+				}
 				if task.isPaused.Load() {
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
 				n, err := resp.Body.Read(buf)
 				if n > 0 {
+					if offset+int64(n) > end+1 {
+						task.setError(fmt.Errorf("分片 %d-%d 返回数据超出范围", start, end))
+						return
+					}
 					_, err = file.WriteAt(buf[:n], offset)
 					if err != nil {
-						task.Error = err
+						task.setError(err)
 						return
 					}
 					offset += int64(n)
 					atomic.AddInt64(&task.Downloaded, int64(n))
 				}
 				if err == io.EOF {
+					if offset != end+1 {
+						task.setError(fmt.Errorf("分片 %d-%d 不完整：收到 %d 字节", start, end, offset-start))
+					}
 					break
 				}
 				if err != nil {
-					task.Error = err
+					task.setError(err)
 					return
 				}
 			}
@@ -397,13 +504,16 @@ func (d *Downloader) downloadMultiThread(task *DownloadTask) error {
 
 	wg.Wait()
 
-	if task.Error == nil {
+	if task.getError() == nil && atomic.LoadInt64(&task.Downloaded) == task.TotalSize {
+		succeeded = true
 		task.SetStatus("completed")
 		if task.progress != nil {
-			task.progress(100, "Completed", atomic.LoadInt64(&task.TotalSize), atomic.LoadInt64(&task.TotalSize))
+			task.progress(100, "Completed", task.TotalSize, task.TotalSize)
 		}
+	} else if task.getError() == nil {
+		task.setError(fmt.Errorf("视频文件不完整：收到 %d/%d 字节", atomic.LoadInt64(&task.Downloaded), task.TotalSize))
 	}
-	return task.Error
+	return task.getError()
 }
 
 func (d *Downloader) downloadSingleThread(task *DownloadTask) error {
@@ -412,12 +522,27 @@ func (d *Downloader) downloadSingleThread(task *DownloadTask) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if err := validateMediaResponse(resp); err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("视频下载失败：HTTP %d", resp.StatusCode)
+	}
+	if resp.ContentLength > 0 {
+		task.TotalSize = resp.ContentLength
+	}
 
 	file, err := utils.CreateFile(task.FilePath)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	succeeded := false
+	defer func() {
+		_ = file.Close()
+		if !succeeded {
+			_ = utils.RemoveFile(task.FilePath)
+		}
+	}()
 
 	task.SetStatus("downloading")
 	task.StartTime = time.Now()
@@ -448,10 +573,36 @@ func (d *Downloader) downloadSingleThread(task *DownloadTask) error {
 			return err
 		}
 	}
+	if task.TotalSize > 0 && atomic.LoadInt64(&task.Downloaded) != task.TotalSize {
+		return fmt.Errorf("视频文件不完整：收到 %d/%d 字节", atomic.LoadInt64(&task.Downloaded), task.TotalSize)
+	}
 
+	succeeded = true
 	task.SetStatus("completed")
 	if task.progress != nil {
-		task.progress(100, "Completed", task.Downloaded, task.TotalSize)
+		task.progress(100, "Completed", atomic.LoadInt64(&task.Downloaded), task.TotalSize)
+	}
+	return nil
+}
+
+func parseContentRange(value string) (int64, int64, int64, error) {
+	var start, end, total int64
+	if _, err := fmt.Sscanf(strings.TrimSpace(value), "bytes %d-%d/%d", &start, &end, &total); err != nil {
+		return 0, 0, 0, err
+	}
+	if start < 0 || end < start || total <= end {
+		return 0, 0, 0, fmt.Errorf("invalid Content-Range")
+	}
+	return start, end, total, nil
+}
+
+func validateMediaResponse(resp *http.Response) error {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("媒体服务器返回 HTTP %d", resp.StatusCode)
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/json") {
+		return fmt.Errorf("媒体服务器返回了非视频内容（%s）", contentType)
 	}
 	return nil
 }
@@ -462,6 +613,10 @@ func (task *DownloadTask) Pause() {
 
 func (task *DownloadTask) Resume() {
 	task.isPaused.Store(false)
+}
+
+func (task *DownloadTask) IsPaused() bool {
+	return task.isPaused.Load()
 }
 
 func (task *DownloadTask) Cancel() {

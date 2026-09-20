@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"path/filepath"
+	"sync"
 
 	"github.com/itsHenry35/tal_downloader/config"
 	"github.com/itsHenry35/tal_downloader/models"
@@ -24,7 +25,10 @@ type CourseSelectionScreen struct {
 	overwriteCheck    *widget.Check
 	container         *fyne.Container
 	courseList        *fyne.Container
-	lectureSelections map[string][]int // courseID -> selected lecture indices
+	lectureSelections map[string][]*models.Lecture
+	lectureCache      map[string][]*models.Lecture
+	selectionSet      map[string]bool
+	lectureMutex      sync.RWMutex
 }
 
 func getDownloadFolderName() string {
@@ -41,7 +45,9 @@ func NewCourseSelectionScreen(manager *Manager) fyne.CanvasObject {
 	cs := &CourseSelectionScreen{
 		manager:           manager,
 		courseChecks:      make(map[string]*widget.Check),
-		lectureSelections: make(map[string][]int),
+		lectureSelections: make(map[string][]*models.Lecture),
+		lectureCache:      make(map[string][]*models.Lecture),
+		selectionSet:      make(map[string]bool),
 		downloadPath:      downloadPath,
 	}
 	cs.loadCourses()
@@ -114,24 +120,20 @@ func (cs *CourseSelectionScreen) buildUI() {
 
 	selectAllButton := widget.NewButton("全选", func() {
 		for courseID, check := range cs.courseChecks {
+			cs.lectureMutex.Lock()
+			delete(cs.lectureSelections, courseID)
+			delete(cs.selectionSet, courseID)
+			cs.lectureMutex.Unlock()
 			check.SetChecked(true)
-			// 获取对应课程的讲数并全选
-			for _, course := range cs.courses {
-				if course.CourseID == courseID {
-					lectures := make([]int, course.EndLiveNum)
-					for i := range lectures {
-						lectures[i] = i
-					}
-					cs.lectureSelections[courseID] = lectures
-					break
-				}
-			}
 		}
 	})
 	deselectAllButton := widget.NewButton("取消全选", func() {
 		for courseID, check := range cs.courseChecks {
 			check.SetChecked(false)
-			cs.lectureSelections[courseID] = []int{}
+			cs.lectureMutex.Lock()
+			delete(cs.lectureSelections, courseID)
+			delete(cs.selectionSet, courseID)
+			cs.lectureMutex.Unlock()
 		}
 	})
 
@@ -192,27 +194,19 @@ func (cs *CourseSelectionScreen) updateCourseList() {
 	for _, course := range cs.courses {
 		courseCopy := course // 避免闭包问题
 
-		check := widget.NewCheck(course.SubjectName+" - "+course.CourseName, func(checked bool) {
-			if checked && len(cs.lectureSelections[courseCopy.CourseID]) == 0 {
-				// 如果勾选但没有选择讲数，默认全选
-				lectures := make([]int, courseCopy.EndLiveNum)
-				for i := range lectures {
-					lectures[i] = i
-				}
-				cs.lectureSelections[courseCopy.CourseID] = lectures
-			} else if !checked {
-				// 取消勾选时清空选择
-				cs.lectureSelections[courseCopy.CourseID] = []int{}
+		check := widget.NewCheck(cs.courseLabel(courseCopy), func(checked bool) {
+			if checked {
+				return
+			}
+			cs.lectureMutex.Lock()
+			delete(cs.lectureSelections, courseCopy.CourseID)
+			delete(cs.selectionSet, courseCopy.CourseID)
+			cs.lectureMutex.Unlock()
+			if courseCheck, ok := cs.courseChecks[courseCopy.CourseID]; ok {
+				courseCheck.SetText(cs.courseLabel(courseCopy))
 			}
 		})
 		cs.courseChecks[course.CourseID] = check
-
-		// 默认全选所有讲
-		lectures := make([]int, course.EndLiveNum)
-		for i := range lectures {
-			lectures[i] = i
-		}
-		cs.lectureSelections[course.CourseID] = lectures
 
 		// 创建选择讲数的按钮
 		selectLecturesBtn := widget.NewButton("...", func() {
@@ -227,19 +221,48 @@ func (cs *CourseSelectionScreen) updateCourseList() {
 }
 
 func (cs *CourseSelectionScreen) showLectureSelectionDialog(course *models.Course) {
-	// 创建讲数选择列表
-	lectureChecks := make([]*widget.Check, course.EndLiveNum)
-	selectedLectures := cs.lectureSelections[course.CourseID]
+	progressDialog := dialog.NewProgressInfinite("加载中...", "正在获取实际课节列表", cs.manager.window)
+	progressDialog.Show()
 
-	// 创建一个map来快速查找已选中的讲
-	selectedMap := make(map[int]bool)
-	for _, idx := range selectedLectures {
-		selectedMap[idx] = true
+	go func() {
+		lectures, err := cs.loadLectures(course)
+		fyne.Do(func() {
+			progressDialog.Dismiss()
+			if err != nil {
+				dialog.ShowError(err, cs.manager.window)
+				return
+			}
+			cs.showLoadedLectureSelectionDialog(course, lectures)
+		})
+	}()
+}
+
+func (cs *CourseSelectionScreen) showLoadedLectureSelectionDialog(course *models.Course, lectures []*models.Lecture) {
+	if len(lectures) == 0 {
+		dialog.ShowInformation("提示", "该课程暂时没有可下载课节", cs.manager.window)
+		return
 	}
 
-	for i := 0; i < course.EndLiveNum; i++ {
-		lectureChecks[i] = widget.NewCheck(fmt.Sprintf("第%d讲", i+1), nil)
-		lectureChecks[i].SetChecked(selectedMap[i])
+	cs.lectureMutex.RLock()
+	selectedLectures := append([]*models.Lecture(nil), cs.lectureSelections[course.CourseID]...)
+	selectionConfigured := cs.selectionSet[course.CourseID]
+	cs.lectureMutex.RUnlock()
+
+	selectedMap := make(map[string]bool)
+	if selectionConfigured {
+		for _, lecture := range selectedLectures {
+			selectedMap[lecture.StableKey()] = true
+		}
+	} else if check, ok := cs.courseChecks[course.CourseID]; ok && check.Checked {
+		for _, lecture := range lectures {
+			selectedMap[lecture.StableKey()] = true
+		}
+	}
+
+	lectureChecks := make([]*widget.Check, len(lectures))
+	for i, lecture := range lectures {
+		lectureChecks[i] = widget.NewCheck(lecture.Label(), nil)
+		lectureChecks[i].SetChecked(selectedMap[lecture.StableKey()])
 	}
 
 	// 创建滚动容器
@@ -268,25 +291,30 @@ func (cs *CourseSelectionScreen) showLectureSelectionDialog(course *models.Cours
 
 	confirmBtn := widget.NewButton("确定", func() {
 		// 收集选中的讲
-		var selected []int
+		var selected []*models.Lecture
 		for i, check := range lectureChecks {
 			if check.Checked {
-				selected = append(selected, i)
+				selected = append(selected, lectures[i])
 			}
 		}
+		cs.lectureMutex.Lock()
 		cs.lectureSelections[course.CourseID] = selected
+		cs.selectionSet[course.CourseID] = true
+		cs.lectureMutex.Unlock()
 
 		// 更新主复选框状态
 		if check, ok := cs.courseChecks[course.CourseID]; ok {
 			if len(selected) == 0 {
 				check.SetChecked(false)
-			} else if len(selected) == course.EndLiveNum {
+				check.SetText(cs.courseLabel(course))
+			} else if len(selected) == len(lectures) {
 				check.SetChecked(true)
+				check.SetText(cs.courseLabel(course))
 			} else {
 				// 部分选中状态 - Fyne不支持三态复选框，所以保持勾选但修改文本提示
 				check.SetChecked(true)
 				check.Text = fmt.Sprintf("%s - %s (已选%d/%d讲)",
-					course.SubjectName, course.CourseName, len(selected), course.EndLiveNum)
+					course.SubjectName, course.CourseName, len(selected), len(lectures))
 				check.Refresh()
 			}
 		}
@@ -319,14 +347,10 @@ func (cs *CourseSelectionScreen) showLectureSelectionDialog(course *models.Cours
 
 func (cs *CourseSelectionScreen) startDownload() {
 	var selectedCourses []*models.Course
-	selectedLectures := make(map[string][]int)
 
 	for _, course := range cs.courses {
 		if check, ok := cs.courseChecks[course.CourseID]; ok && check.Checked {
-			if lectures, ok := cs.lectureSelections[course.CourseID]; ok && len(lectures) > 0 {
-				selectedCourses = append(selectedCourses, course)
-				selectedLectures[course.CourseID] = lectures
-			}
+			selectedCourses = append(selectedCourses, course)
 		}
 	}
 
@@ -335,19 +359,102 @@ func (cs *CourseSelectionScreen) startDownload() {
 		return
 	}
 
-	if err := utils.Mkdir(cs.downloadPath); err != nil {
-		utils.ShowErrorDialog(err, cs.manager.window)
-		return
+	downloadPath := cs.downloadPath
+	isExtensive := cs.extensiveCheck.Checked
+	isOverwrite := !utils.IsAndroid() && cs.overwriteCheck.Checked
+	progressDialog := dialog.NewProgressInfinite("加载中...", "正在确认所选课节", cs.manager.window)
+	progressDialog.Show()
+
+	go func() {
+		resolvedCourses := make([]*models.Course, 0, len(selectedCourses))
+		resolvedLectures := make(map[string][]*models.Lecture)
+
+		for _, course := range selectedCourses {
+			course := course
+			lectures, err := cs.loadLectures(course)
+			if err != nil {
+				fyne.Do(func() {
+					progressDialog.Dismiss()
+					dialog.ShowError(fmt.Errorf("%s：%w", course.CourseName, err), cs.manager.window)
+				})
+				return
+			}
+
+			cs.lectureMutex.RLock()
+			configured := cs.selectionSet[course.CourseID]
+			selected := append([]*models.Lecture(nil), cs.lectureSelections[course.CourseID]...)
+			cs.lectureMutex.RUnlock()
+
+			if configured {
+				selectedKeys := make(map[string]bool, len(selected))
+				for _, lecture := range selected {
+					selectedKeys[lecture.StableKey()] = true
+				}
+				selected = selected[:0]
+				for _, lecture := range lectures {
+					if selectedKeys[lecture.StableKey()] {
+						selected = append(selected, lecture)
+					}
+				}
+			} else {
+				selected = append([]*models.Lecture(nil), lectures...)
+			}
+
+			if len(selected) > 0 {
+				resolvedCourses = append(resolvedCourses, course)
+				resolvedLectures[course.CourseID] = selected
+			}
+		}
+
+		if len(resolvedCourses) == 0 {
+			fyne.Do(func() {
+				progressDialog.Dismiss()
+				dialog.ShowInformation("提示", "所选课程没有可下载课节", cs.manager.window)
+			})
+			return
+		}
+		if err := utils.Mkdir(downloadPath); err != nil {
+			fyne.Do(func() {
+				progressDialog.Dismiss()
+				dialog.ShowError(err, cs.manager.window)
+			})
+			return
+		}
+
+		fyne.Do(func() {
+			progressDialog.Dismiss()
+			cs.manager.selectedCourses = resolvedCourses
+			cs.manager.selectedLectures = resolvedLectures
+			cs.manager.downloadPath = downloadPath
+			cs.manager.isExtensive = isExtensive
+			cs.manager.isOverwrite = isOverwrite
+			cs.manager.ShowDownloadProgress()
+		})
+	}()
+}
+
+func (cs *CourseSelectionScreen) loadLectures(course *models.Course) ([]*models.Lecture, error) {
+	if course == nil {
+		return nil, fmt.Errorf("课程信息为空")
+	}
+	courseID := course.CourseID
+	cs.lectureMutex.RLock()
+	lectures, ok := cs.lectureCache[courseID]
+	cs.lectureMutex.RUnlock()
+	if ok {
+		return lectures, nil
 	}
 
-	cs.manager.selectedCourses = selectedCourses
-	cs.manager.selectedLectures = selectedLectures
-	cs.manager.downloadPath = cs.downloadPath
-	cs.manager.isExtensive = cs.extensiveCheck.Checked
-	if utils.IsAndroid() {
-		cs.manager.isOverwrite = false
-	} else {
-		cs.manager.isOverwrite = cs.overwriteCheck.Checked
+	lectures, err := cs.manager.apiClient.GetCourseLectures(course)
+	if err != nil {
+		return nil, err
 	}
-	cs.manager.ShowDownloadProgress()
+	cs.lectureMutex.Lock()
+	cs.lectureCache[courseID] = lectures
+	cs.lectureMutex.Unlock()
+	return lectures, nil
+}
+
+func (cs *CourseSelectionScreen) courseLabel(course *models.Course) string {
+	return course.SubjectName + " - " + course.CourseName
 }

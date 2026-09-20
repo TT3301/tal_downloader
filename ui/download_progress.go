@@ -176,6 +176,14 @@ func (ds *DownloadProgressScreen) applyProgressUpdate(update ProgressUpdate) {
 				}
 			} else {
 				speedLabel.SetText(fmt.Sprintf("下载速度: %s", speed))
+				if hasPauseBtn {
+					ds.tasksMutex.RLock()
+					task := ds.taskMap[filePath]
+					ds.tasksMutex.RUnlock()
+					if task != nil && !task.IsPaused() {
+						pauseBtn.SetText("暂停")
+					}
+				}
 			}
 		}
 	}
@@ -276,9 +284,9 @@ func (ds *DownloadProgressScreen) startDownloads() {
 			progressList.Add(widget.NewSeparator())
 		}
 
-		// 获取选中的讲
-		selectedLectureIndices := ds.manager.selectedLectures[course.CourseID]
-		selectedCount := len(selectedLectureIndices)
+		// 这里保存的是用户实际选择的课节对象，不再保存数组下标。
+		selectedLectures := ds.manager.selectedLectures[course.CourseID]
+		selectedCount := len(selectedLectures)
 
 		// 添加课程标题
 		courseLabel := widget.NewLabelWithStyle(
@@ -303,76 +311,69 @@ func (ds *DownloadProgressScreen) startDownloads() {
 		))
 
 		wg.Add(1)
-		go func(course *models.Course, courseDir string, selectedIndices []int) {
+		go func(course *models.Course, courseDir string, lectures []*models.Lecture) {
 			defer wg.Done()
 
-			lectures, err := ds.manager.apiClient.GetLectures(course.CourseID)
-			if err != nil {
-				utils.ShowErrorDialog(err, ds.manager.window)
-				return
-			}
-
-			// 创建选中索引的map以便快速查找
-			selectedMap := make(map[int]bool)
-			for _, idx := range selectedIndices {
-				selectedMap[idx] = true
-			}
-
-			// 只下载选中的讲，并且不超过endLiveNum
 			for j, lecture := range lectures {
-				// 跳过未选中的讲
-				if !selectedMap[j] {
+				if lecture == nil {
 					continue
 				}
 
-				// 确保不超过已结束的讲数
-				if j >= course.EndLiveNum {
-					fyne.Do(func() {
-						ds.addErrorItem(course.CourseID, fmt.Sprintf("第%d讲", j+1), "该讲尚未开始")
-					})
-					continue
+				lectureNumber := lecture.ListIndex
+				if lectureNumber <= 0 {
+					lectureNumber = j + 1
 				}
-
-				fileName := fmt.Sprintf("第%d讲.mp4", j+1)
+				fileName := fmt.Sprintf("第%d讲.mp4", lectureNumber)
 				if ds.manager.isExtensive {
-					lecture.LiveTypeString = "ONLINE_REAL_RECORD" // 强制设为延伸课程类型
-					fileName = fmt.Sprintf("第%d讲_延伸内容.mp4", j+1)
+					fileName = fmt.Sprintf("第%d讲_延伸内容.mp4", lectureNumber)
 				}
 				filePath := filepath.Join(courseDir, fileName)
 
 				// 检查文件是否存在
 				if !utils.IsAndroid() {
 					if utils.IsFileExists(filePath) && !ds.manager.isOverwrite {
+						existingFileName := fileName
+						existingFilePath := filePath
 						fyne.Do(func() {
-							ds.addProgressItem(course.CourseID, fileName, filePath, true, -1)
+							ds.addProgressItem(course.CourseID, existingFileName, existingFilePath, true, -1)
 						})
 						continue
 					}
 				}
 
-				videoURL, err := ds.manager.apiClient.GetVideoURL(lecture, course.CourseID, course.TutorID)
+				var videoURL string
+				var err error
+				if ds.manager.isExtensive {
+					videoURL, err = ds.manager.apiClient.GetCourseExtensiveVideoURL(lecture, course)
+				} else {
+					videoURL, err = ds.manager.apiClient.GetCourseVideoURL(lecture, course)
+				}
 				if err != nil {
+					failedFileName := fileName
+					errorMessage := err.Error()
 					fyne.Do(func() {
-						ds.addErrorItem(course.CourseID, fileName, err.Error())
+						ds.addErrorItem(course.CourseID, failedFileName, errorMessage)
 					})
 					continue
 				}
 
-				task := dl.AddTask(videoURL, filePath, func(progress float64, speed string, currsize int64, totalSize int64) {
-					ds.updateProgress(filePath, progress, speed, currsize, totalSize)
+				taskFileName := fileName
+				taskFilePath := filePath
+				task := dl.AddTask(videoURL, taskFilePath, func(progress float64, speed string, currsize int64, totalSize int64) {
+					ds.updateProgress(taskFilePath, progress, speed, currsize, totalSize)
 				})
 
 				// 线程安全地添加任务
 				ds.tasksMutex.Lock()
 				ds.downloadTasks = append(ds.downloadTasks, task)
-				ds.taskMap[filePath] = task // 保存任务映射
+				ds.taskMap[taskFilePath] = task // 保存任务映射
 				ds.tasksMutex.Unlock()
 
 				fyne.Do(func() {
-					ds.addProgressItem(course.CourseID, fileName, filePath, false, task.TotalSize)
+					ds.addProgressItem(course.CourseID, taskFileName, taskFilePath, false, task.TotalSize)
 				})
 			}
-		}(course, courseDir, selectedLectureIndices)
+		}(course, courseDir, selectedLectures)
 
 	}
 
@@ -535,6 +536,17 @@ func (ds *DownloadProgressScreen) toggleSingleTask(filePath string) {
 		ds.uiMapsMutex.RUnlock()
 
 		if hasBbtn {
+			if task.Status() == "error" {
+				btn.Disable()
+				if err := ds.manager.downloader.Retry(task); err != nil {
+					btn.Enable()
+					dialog.ShowError(err, ds.manager.window)
+					return
+				}
+				btn.SetText("暂停")
+				btn.Enable()
+				return
+			}
 			// 检查任务当前是否被暂停
 			if btn.Text == "暂停" {
 				task.Pause()

@@ -25,3 +25,12 @@ type RecordModeVideoUrlResponse struct {
 	Definitions map[string][]string `json:"definitions"`
 	Message     string              `json:"message"`
 }
+
+type OnlineRecordAuthResponse struct {
+	InitData struct {
+		Task struct {
+			RealRecordID FlexibleID `json:"realRecordId"`
+		} `json:"task"`
+	} `json:"initData"`
+	Message string `json:"message"`
+}
