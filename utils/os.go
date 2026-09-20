@@ -68,6 +68,10 @@ func CreateFile(path string) (*os.File, error) {
 	return os.Create(actualPath)
 }
 
+func RemoveFile(path string) error {
+	return os.Remove(GetAndroidSafeFilePath(path))
+}
+
 func CopyToAndroidStorage(sourcePath string, writer fyne.URIWriteCloser) error {
 	actualPath := GetAndroidSafeFilePath(sourcePath)
 

@@ -1,0 +1,2729 @@
+diff --git a/api/client.go b/api/client.go
+index 3be5936..607576b 100644
+--- a/api/client.go
++++ b/api/client.go
+@@ -119,3 +119,23 @@ func (c *Client) doRequest(method, urlStr string, body interface{}, headers map[
+ 
+ 	return resp, nil
+ }
++
++func requireHTTPSuccess(resp *http.Response) error {
++	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
++		return nil
++	}
++
++	var apiError struct {
++		Message string `json:"message"`
++		ErrMsg  string `json:"errmsg"`
++	}
++	_ = json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&apiError)
++	message := strings.TrimSpace(apiError.Message)
++	if message == "" {
++		message = strings.TrimSpace(apiError.ErrMsg)
++	}
++	if message != "" {
++		return fmt.Errorf("接口请求失败（HTTP %d）：%s", resp.StatusCode, message)
++	}
++	return fmt.Errorf("接口请求失败（HTTP %d）", resp.StatusCode)
++}
+diff --git a/api/course.go b/api/course.go
+index 0378b6e..d4130af 100644
+--- a/api/course.go
++++ b/api/course.go
+@@ -3,6 +3,8 @@ package api
+ import (
+ 	"encoding/json"
+ 	"fmt"
++	"net/url"
++	"strings"
+ 
+ 	"github.com/itsHenry35/tal_downloader/config"
+ 	"github.com/itsHenry35/tal_downloader/models"
+@@ -23,6 +25,10 @@ func (c *Client) GetCourseList() ([]*models.Course, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if err := requireHTTPSuccess(resp); err != nil {
++			resp.Body.Close()
++			return nil, err
++		}
+ 
+ 		var courses []*models.Course
+ 		if err := json.NewDecoder(resp.Body).Decode(&courses); err != nil {
+@@ -39,12 +45,43 @@ func (c *Client) GetCourseList() ([]*models.Course, error) {
+ 		page++
+ 	}
+ 
+-	return allCourses, nil
++	return mergeDuplicateCourses(allCourses), nil
++}
++
++func mergeDuplicateCourses(courses []*models.Course) []*models.Course {
++	merged := make([]*models.Course, 0, len(courses))
++	byLogicalKey := make(map[string]*models.Course)
++
++	for _, course := range courses {
++		if course == nil {
++			continue
++		}
++		name := strings.Join(strings.Fields(course.CourseName), " ")
++		subject := strings.Join(strings.Fields(course.SubjectName), " ")
++		if name == "" || course.CourseID == "" {
++			merged = append(merged, course)
++			continue
++		}
++
++		// endLiveNum is part of the key so two genuinely different editions with
++		// the same display name but different lesson counts remain separate.
++		key := fmt.Sprintf("%s\x00%s\x00%d", subject, name, course.EndLiveNum)
++		if primary, exists := byLogicalKey[key]; exists {
++			primary.SourceCourses = append(primary.SourceCourses, course.Sources()...)
++			continue
++		}
++
++		course.SourceCourses = course.Sources()
++		byLogicalKey[key] = course
++		merged = append(merged, course)
++	}
++	return merged
+ }
+ 
+ // GetLectures retrieves lectures for a course, paginated fetch until empty result
+ func (c *Client) GetLectures(courseID string) ([]*models.Lecture, error) {
+ 	var allLectures []*models.Lecture
++	seenLectures := make(map[string]struct{})
+ 	page := 1
+ 	perPage := 10
+ 
+@@ -56,6 +93,10 @@ func (c *Client) GetLectures(courseID string) ([]*models.Lecture, error) {
+ 		if err != nil {
+ 			return nil, err
+ 		}
++		if err := requireHTTPSuccess(resp); err != nil {
++			resp.Body.Close()
++			return nil, err
++		}
+ 
+ 		var lectures []*models.Lecture
+ 		if err := json.NewDecoder(resp.Body).Decode(&lectures); err != nil {
+@@ -68,17 +109,168 @@ func (c *Client) GetLectures(courseID string) ([]*models.Lecture, error) {
+ 			break // no more data
+ 		}
+ 
+-		allLectures = append(allLectures, lectures...)
++		added := 0
++		for _, lecture := range lectures {
++			if lecture == nil {
++				continue
++			}
++			// Only deduplicate entries with a real live ID. Placeholder rows may
++			// legitimately share empty identifiers.
++			if lecture.LiveID != 0 {
++				key := fmt.Sprintf("%d|%s|%s|%s", lecture.LiveID, lecture.ClassID,
++					lecture.SubjectID, lecture.LiveTypeString)
++				if _, exists := seenLectures[key]; exists {
++					continue
++				}
++				seenLectures[key] = struct{}{}
++			}
++			lecture.ListIndex = len(allLectures) + 1
++			allLectures = append(allLectures, lecture)
++			added++
++		}
++
++		// A short page is the end of a normal paginated response. If an API
++		// regression repeats the same page, added == 0 prevents an infinite loop.
++		if len(lectures) < perPage || added == 0 {
++			break
++		}
+ 		page++
+ 	}
+ 
+ 	return allLectures, nil
+ }
+ 
++// GetCourseLectures joins duplicate enrollment records created by class
++// transfers. The first server-ordered course entry owns each visible lecture;
++// only records with a stable identity are retained as fallbacks. Unmatched
++// historical lessons remain visible instead of being joined by array position.
++func (c *Client) GetCourseLectures(course *models.Course) ([]*models.Lecture, error) {
++	if course == nil {
++		return nil, fmt.Errorf("课程信息为空")
++	}
++
++	var merged []*models.Lecture
++	var failures []string
++
++	for _, source := range course.Sources() {
++		lectures, err := c.GetLectures(source.CourseID)
++		if err != nil {
++			failures = append(failures, fmt.Sprintf("%s: %v", source.CourseID, err))
++			continue
++		}
++		matches := buildLectureMatchIndex(merged, lectures)
++		for _, lecture := range lectures {
++			if lecture == nil {
++				continue
++			}
++			lecture.SourceCourseID = source.CourseID
++			lecture.SourceTutorID = source.TutorID
++			if primary := matches.find(lecture); primary != nil {
++				primary.Alternates = append(primary.Alternates, lecture)
++				continue
++			}
++			lecture.ListIndex = len(merged) + 1
++			merged = append(merged, lecture)
++		}
++	}
++
++	if len(merged) == 0 && len(failures) > 0 {
++		return nil, fmt.Errorf("获取课程课节失败：%s", strings.Join(failures, "; "))
++	}
++	for index, lecture := range merged {
++		lecture.ListIndex = index + 1
++	}
++	return merged, nil
++}
++
++type lectureMatchIndex struct {
++	byStrongKey map[string]*models.Lecture
++	byTitle     map[string]*models.Lecture
++	titleCount  map[string]int
++}
++
++func buildLectureMatchIndex(existing, incoming []*models.Lecture) lectureMatchIndex {
++	index := lectureMatchIndex{
++		byStrongKey: make(map[string]*models.Lecture),
++		byTitle:     make(map[string]*models.Lecture),
++		titleCount:  make(map[string]int),
++	}
++
++	for _, lecture := range existing {
++		if lecture == nil {
++			continue
++		}
++		for _, key := range strongLectureKeys(lecture) {
++			index.byStrongKey[key] = lecture
++		}
++		if key := lectureTitleKey(lecture); key != "" {
++			index.titleCount[key]++
++			index.byTitle[key] = lecture
++		}
++	}
++
++	// A title is only safe as a fallback identity when it is unique on both
++	// sides. Generic or repeated names must never silently connect two classes.
++	incomingTitleCount := make(map[string]int)
++	for _, lecture := range incoming {
++		if key := lectureTitleKey(lecture); key != "" {
++			incomingTitleCount[key]++
++		}
++	}
++	for key, count := range incomingTitleCount {
++		if count != 1 || index.titleCount[key] != 1 {
++			delete(index.byTitle, key)
++		}
++	}
++	return index
++}
++
++func (index lectureMatchIndex) find(lecture *models.Lecture) *models.Lecture {
++	for _, key := range strongLectureKeys(lecture) {
++		if primary := index.byStrongKey[key]; primary != nil {
++			return primary
++		}
++	}
++	if key := lectureTitleKey(lecture); key != "" {
++		return index.byTitle[key]
++	}
++	return nil
++}
++
++func strongLectureKeys(lecture *models.Lecture) []string {
++	if lecture == nil {
++		return nil
++	}
++	keys := make([]string, 0, len(lecture.Tasks)+1)
++	if lecture.LiveID != 0 {
++		keys = append(keys, fmt.Sprintf("live:%s:%d", lecture.LiveTypeString, lecture.LiveID))
++	}
++	for _, task := range lecture.Tasks {
++		if task.CurriculumID == "" || task.TaskID == "" || task.CoursewareID == "" {
++			continue
++		}
++		keys = append(keys, fmt.Sprintf("task:%s:%s:%s", task.CurriculumID, task.TaskID, task.CoursewareID))
++	}
++	return keys
++}
++
++func lectureTitleKey(lecture *models.Lecture) string {
++	if lecture == nil {
++		return ""
++	}
++	title := strings.ToLower(strings.Join(strings.Fields(lecture.DisplayName), " "))
++	if title == "" {
++		return ""
++	}
++	return lecture.LiveTypeString + "\x00" + title
++}
++
+ // GetVideoURL retrieves the download URL for a video
+ func (c *Client) GetVideoURL(lecture *models.Lecture, courseID, tutorID string) (string, error) {
++	if lecture == nil {
++		return "", fmt.Errorf("课节信息为空")
++	}
+ 	headers := map[string]string{
+-		"Host":          "classroom-api-online.saasp.vdyoo.com",
+ 		"lecturerId":    lecture.LecturerID,
+ 		"stdSubject":    lecture.SubjectID,
+ 		"tutorId":       tutorID,
+@@ -98,6 +290,9 @@ func (c *Client) GetVideoURL(lecture *models.Lecture, courseID, tutorID string)
+ 			return "", err
+ 		}
+ 		defer resp.Body.Close()
++		if err := requireHTTPSuccess(resp); err != nil {
++			return "", err
++		}
+ 
+ 		var result models.VideoUrlResponse
+ 
+@@ -108,35 +303,126 @@ func (c *Client) GetVideoURL(lecture *models.Lecture, courseID, tutorID string)
+ 		return utils.ParseVideoUrl(result.VideoURLs, result.Message)
+ 
+ 	case "RECORD_MODE", "ONLINE_REAL_RECORD":
+-		url := fmt.Sprintf("%s/classroom-ai/record/v1/resources", config.ClassroomAPIBase)
+-		resp, err := c.doRequest("GET", url, nil, headers, false)
+-		if err != nil {
+-			return "", err
+-		}
+-		defer resp.Body.Close()
++		return c.getRecordVideoURL(headers)
+ 
+-		var result models.RecordModeVideoUrlResponse
++	default:
++		return "", fmt.Errorf("unsupported live type: %s", lecture.LiveTypeString)
++	}
+ 
+-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+-			return "", err
+-		}
++}
++
++func (c *Client) GetCourseVideoURL(lecture *models.Lecture, course *models.Course) (string, error) {
++	return c.resolveLectureVideo(lecture, course, false)
++}
++
++func (c *Client) GetCourseExtensiveVideoURL(lecture *models.Lecture, course *models.Course) (string, error) {
++	return c.resolveLectureVideo(lecture, course, true)
++}
+ 
+-		var videoURL string
++func (c *Client) resolveLectureVideo(lecture *models.Lecture, course *models.Course, extensive bool) (string, error) {
++	if lecture == nil || course == nil {
++		return "", fmt.Errorf("课程或课节信息为空")
++	}
+ 
+-		for _, urls := range result.Definitions {
+-			if len(urls) > 0 {
+-				videoURL = urls[len(urls)-1]
+-				break
++	candidates := append([]*models.Lecture{lecture}, lecture.Alternates...)
++	var failures []string
++	for _, candidate := range candidates {
++		if candidate == nil {
++			continue
++		}
++		var (
++			videoURL string
++			err      error
++		)
++		if extensive {
++			videoURL, err = c.GetExtensiveVideoURL(candidate)
++		} else {
++			courseID := candidate.SourceCourseID
++			tutorID := candidate.SourceTutorID
++			if courseID == "" {
++				courseID = course.CourseID
++			}
++			if tutorID == "" {
++				tutorID = course.TutorID
+ 			}
++			videoURL, err = c.GetVideoURL(candidate, courseID, tutorID)
+ 		}
++		if err == nil {
++			return videoURL, nil
++		}
++		failures = append(failures, err.Error())
++	}
++
++	return "", fmt.Errorf("所有课程来源均无法解析该讲：%s", strings.Join(failures, "; "))
++}
++
++// GetExtensiveVideoURL resolves the extension-course task to its own recording
++// ID. Reusing the base lecture liveId downloads the wrong lesson whenever the
++// extension content is stored as ONLINE_REAL_RECORD.
++func (c *Client) GetExtensiveVideoURL(lecture *models.Lecture) (string, error) {
++	if lecture == nil || len(lecture.Tasks) == 0 {
++		return "", fmt.Errorf("该讲没有延伸课程")
++	}
+ 
+-		if videoURL == "" {
+-			return "", fmt.Errorf("未找到回放：%s", result.Message)
++	var task *models.LectureTask
++	for i := range lecture.Tasks {
++		candidate := &lecture.Tasks[i]
++		if candidate.CurriculumID != "" && candidate.TaskID != "" && candidate.CoursewareID != "" {
++			task = candidate
++			break
+ 		}
+-		return videoURL, nil
++	}
++	if task == nil {
++		return "", fmt.Errorf("该讲的延伸课程信息不完整")
++	}
+ 
+-	default:
+-		return "", fmt.Errorf("unsupported live type: %s", lecture.LiveTypeString)
++	query := url.Values{}
++	query.Set("curriculumId", task.CurriculumID.String())
++	query.Set("taskId", task.TaskID.String())
++	query.Set("taskTypeString", "ONLINE_REAL_RECORD")
++	query.Set("coursewareId", task.CoursewareID.String())
++	authURL := fmt.Sprintf("%s/classroom/basic/v1/real-record/init/auth?%s",
++		config.ClassroomAPIBase, query.Encode())
++
++	resp, err := c.doRequest("GET", authURL, nil, nil, false)
++	if err != nil {
++		return "", err
++	}
++	defer resp.Body.Close()
++	if err := requireHTTPSuccess(resp); err != nil {
++		return "", err
+ 	}
+ 
++	var authResult models.OnlineRecordAuthResponse
++	if err := json.NewDecoder(resp.Body).Decode(&authResult); err != nil {
++		return "", err
++	}
++	if authResult.InitData.Task.RealRecordID == "" {
++		return "", fmt.Errorf("未找到延伸课程录像：%s", authResult.Message)
++	}
++
++	headers := map[string]string{
++		"lecturerId": lecture.LecturerID,
++		"liveId":     authResult.InitData.Task.RealRecordID.String(),
++		"liveType":   "ONLINE_REAL_RECORD",
++	}
++	return c.getRecordVideoURL(headers)
++}
++
++func (c *Client) getRecordVideoURL(headers map[string]string) (string, error) {
++	recordURL := fmt.Sprintf("%s/classroom-ai/record/v1/resources", config.ClassroomAPIBase)
++	resp, err := c.doRequest("GET", recordURL, nil, headers, false)
++	if err != nil {
++		return "", err
++	}
++	defer resp.Body.Close()
++	if err := requireHTTPSuccess(resp); err != nil {
++		return "", err
++	}
++
++	var result models.RecordModeVideoUrlResponse
++	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
++		return "", err
++	}
++	return utils.ParseRecordVideoURL(result.Definitions, result.Message)
+ }
+diff --git a/downloader/downloader.go b/downloader/downloader.go
+index 3f07090..92a012f 100644
+--- a/downloader/downloader.go
++++ b/downloader/downloader.go
+@@ -6,7 +6,6 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"path/filepath"
+-	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -37,6 +36,7 @@ type DownloadTask struct {
+ 	// 状态相关
+ 	statusMutex sync.RWMutex
+ 	status      string
++	errorMutex  sync.RWMutex
+ }
+ 
+ // Status getter and setter methods for thread safety
+@@ -52,10 +52,32 @@ func (task *DownloadTask) SetStatus(status string) {
+ 	task.status = status
+ }
+ 
++func (task *DownloadTask) setError(err error) {
++	if err == nil {
++		return
++	}
++	task.errorMutex.Lock()
++	defer task.errorMutex.Unlock()
++	if task.Error == nil {
++		task.Error = err
++	}
++}
++
++func (task *DownloadTask) getError() error {
++	task.errorMutex.RLock()
++	defer task.errorMutex.RUnlock()
++	return task.Error
++}
++
++func (task *DownloadTask) clearError() {
++	task.errorMutex.Lock()
++	task.Error = nil
++	task.errorMutex.Unlock()
++}
++
+ type ProgressManager struct {
+ 	tasks      map[*DownloadTask]bool
+ 	tasksMutex sync.RWMutex
+-	ticker     *time.Ticker
+ 	stopChan   chan struct{}
+ 	started    bool
+ 	startMutex sync.Mutex // 保护started字段
+@@ -63,8 +85,7 @@ type ProgressManager struct {
+ 
+ func NewProgressManager() *ProgressManager {
+ 	return &ProgressManager{
+-		tasks:    make(map[*DownloadTask]bool),
+-		stopChan: make(chan struct{}),
++		tasks: make(map[*DownloadTask]bool),
+ 	}
+ }
+ 
+@@ -83,11 +104,13 @@ func (pm *ProgressManager) AddTask(task *DownloadTask) {
+ 	shouldStart := !pm.started
+ 	if shouldStart {
+ 		pm.started = true
++		pm.stopChan = make(chan struct{})
+ 	}
++	stopChan := pm.stopChan
+ 	pm.startMutex.Unlock()
+ 
+ 	if shouldStart {
+-		pm.start()
++		pm.start(stopChan)
+ 	}
+ }
+ 
+@@ -101,44 +124,27 @@ func (pm *ProgressManager) RemoveTask(task *DownloadTask) {
+ 	shouldStop := len(pm.tasks) == 0 && pm.started
+ 	if shouldStop {
+ 		pm.started = false
++		close(pm.stopChan)
+ 	}
+ 	pm.startMutex.Unlock()
+-
+-	if shouldStop {
+-		pm.stop()
+-	}
+ }
+ 
+-func (pm *ProgressManager) start() {
+-	pm.ticker = time.NewTicker(100 * time.Millisecond)
++func (pm *ProgressManager) start(stopChan <-chan struct{}) {
++	ticker := time.NewTicker(100 * time.Millisecond)
+ 
+ 	go func() {
+-		defer pm.ticker.Stop()
++		defer ticker.Stop()
+ 		for {
+ 			select {
+-			case <-pm.ticker.C:
++			case <-ticker.C:
+ 				pm.updateAllTasks()
+-			case <-pm.stopChan:
++			case <-stopChan:
+ 				return
+ 			}
+ 		}
+ 	}()
+ }
+ 
+-func (pm *ProgressManager) stop() {
+-	// 创建新的stopChan来避免重复关闭问题
+-	pm.startMutex.Lock()
+-	oldStopChan := pm.stopChan
+-	pm.stopChan = make(chan struct{})
+-	pm.startMutex.Unlock()
+-
+-	// 通知停止（非阻塞）
+-	select {
+-	case oldStopChan <- struct{}{}:
+-	default:
+-	}
+-}
+-
+ func (pm *ProgressManager) updateAllTasks() {
+ 	pm.tasksMutex.RLock()
+ 	taskList := make([]*DownloadTask, 0, len(pm.tasks))
+@@ -268,58 +274,119 @@ func (d *Downloader) AddTask(url, filePath string, progressFunc func(float64, st
+ }
+ 
+ func (d *Downloader) Start() {
+-	semaphore := make(chan struct{}, d.concurrentFiles)
++	d.mu.Lock()
++	pendingTasks := append([]*DownloadTask(nil), d.tasks...)
++	d.tasks = nil
++	d.mu.Unlock()
++
++	concurrentFiles := d.concurrentFiles
++	if concurrentFiles < 1 {
++		concurrentFiles = 1
++	}
++	semaphore := make(chan struct{}, concurrentFiles)
+ 
+-	for _, task := range d.tasks {
+-		task.wg.Add(1)
+-		go func(t *DownloadTask) {
+-			defer t.wg.Done()
++	for _, task := range pendingTasks {
++		d.startTask(task, semaphore)
++	}
++}
++
++func (d *Downloader) startTask(task *DownloadTask, semaphore chan struct{}) {
++	task.wg.Add(1)
++	go func(t *DownloadTask) {
++		defer t.wg.Done()
++		if semaphore != nil {
+ 			semaphore <- struct{}{}
+ 			defer func() { <-semaphore }()
+-			if err := d.downloadFile(t); err != nil {
+-				t.Error = err
+-				t.SetStatus("error")
+-				if t.progress != nil {
+-					t.progress(0, fmt.Sprintf("错误： %v", err), -1, -1)
+-				}
++		}
++		if err := d.downloadFile(t); err != nil {
++			t.setError(err)
++			t.SetStatus("error")
++			if t.progress != nil {
++				t.progress(0, fmt.Sprintf("错误： %v", err), -1, -1)
+ 			}
+-		}(task)
++		}
++	}(task)
++}
++
++// Retry restarts a failed task. Resume only controls a live paused request and
++// cannot revive a goroutine that has already returned with an error.
++func (d *Downloader) Retry(task *DownloadTask) error {
++	if task == nil {
++		return fmt.Errorf("下载任务为空")
++	}
++
++	task.statusMutex.Lock()
++	if task.status != "error" {
++		status := task.status
++		task.statusMutex.Unlock()
++		return fmt.Errorf("只有失败任务可以重试，当前状态：%s", status)
+ 	}
++	task.status = "pending"
++	task.statusMutex.Unlock()
++
++	task.clearError()
++	task.isPaused.Store(false)
++	atomic.StoreInt64(&task.Downloaded, 0)
++	atomic.StoreInt64(&task.DownloadedParts, 0)
++	d.startTask(task, nil)
++	return nil
+ }
+ 
+ func (d *Downloader) downloadRegularFile(task *DownloadTask) error {
+ 	task.SetStatus("preparing")
+ 	task.StartTime = time.Now()
++	atomic.StoreInt64(&task.Downloaded, 0)
++	task.clearError()
+ 
+ 	// 创建目录
+ 	if err := utils.Mkdir(filepath.Dir(task.FilePath)); err != nil {
+ 		return err
+ 	}
+ 
+-	// HEAD 请求判断是否支持 Range
+-	req, err := http.NewRequest("HEAD", task.URL, nil)
++	supportsRange, totalSize, err := d.probeRegularFile(task.URL)
+ 	if err != nil {
+ 		return err
+ 	}
++	task.TotalSize = totalSize
++
++	if !supportsRange || totalSize <= 0 || d.perFileThreads <= 1 {
++		return d.downloadSingleThread(task)
++	}
++
++	return d.downloadMultiThread(task)
++}
++
++func (d *Downloader) probeRegularFile(rawURL string) (bool, int64, error) {
++	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
++	if err != nil {
++		return false, 0, err
++	}
++	req.Header.Set("Range", "bytes=0-0")
++
+ 	resp, err := d.client.Do(req)
+ 	if err != nil {
+-		return err
++		return false, 0, err
+ 	}
+-	resp.Body.Close()
++	defer resp.Body.Close()
+ 
+-	supportsRange := strings.ToLower(resp.Header.Get("Accept-Ranges")) == "bytes"
+-	if !supportsRange {
+-		// 回退到单线程下载
+-		task.TotalSize = -1 // 标记为未知大小
+-		return d.downloadSingleThread(task)
++	if err := validateMediaResponse(resp); err != nil {
++		return false, 0, err
+ 	}
+-	sizeStr := resp.Header.Get("Content-Length")
+-	if sizeStr == "" {
+-		return fmt.Errorf("Content-Length not provided")
++	if resp.StatusCode == http.StatusPartialContent {
++		start, end, total, err := parseContentRange(resp.Header.Get("Content-Range"))
++		if err != nil || start != 0 || end != 0 || total <= 0 {
++			return false, 0, fmt.Errorf("服务器返回了无效的 Content-Range: %q", resp.Header.Get("Content-Range"))
++		}
++		return true, total, nil
+ 	}
+-	task.TotalSize, _ = strconv.ParseInt(sizeStr, 10, 64)
+-
+-	return d.downloadMultiThread(task)
++	if resp.StatusCode == http.StatusOK {
++		total := resp.ContentLength
++		if total < 0 {
++			total = 0
++		}
++		return false, total, nil
++	}
++	return false, 0, fmt.Errorf("视频探测失败：HTTP %d", resp.StatusCode)
+ }
+ 
+ func (d *Downloader) downloadMultiThread(task *DownloadTask) error {
+@@ -327,14 +394,27 @@ func (d *Downloader) downloadMultiThread(task *DownloadTask) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer file.Close()
++	succeeded := false
++	defer func() {
++		_ = file.Close()
++		if !succeeded {
++			_ = utils.RemoveFile(task.FilePath)
++		}
++	}()
+ 
+ 	// 预分配文件大小
+ 	if err := file.Truncate(task.TotalSize); err != nil {
+ 		return err
+ 	}
+ 
+-	partSize := task.TotalSize / int64(d.perFileThreads)
++	threadCount := d.perFileThreads
++	if int64(threadCount) > task.TotalSize {
++		threadCount = int(task.TotalSize)
++	}
++	if threadCount < 1 {
++		return fmt.Errorf("视频大小无效：%d", task.TotalSize)
++	}
++	partSize := task.TotalSize / int64(threadCount)
+ 	var wg sync.WaitGroup
+ 
+ 	task.SetStatus("downloading")
+@@ -343,52 +423,79 @@ func (d *Downloader) downloadMultiThread(task *DownloadTask) error {
+ 	d.progressManager.AddTask(task)
+ 	defer d.progressManager.RemoveTask(task)
+ 
+-	for i := 0; i < d.perFileThreads; i++ {
++	for i := 0; i < threadCount; i++ {
+ 		wg.Add(1)
+ 		start := int64(i) * partSize
+ 		end := start + partSize - 1
+-		if i == d.perFileThreads-1 {
++		if i == threadCount-1 {
+ 			end = task.TotalSize - 1
+ 		}
+ 
+ 		go func(start, end int64) {
+ 			defer wg.Done()
++			if task.getError() != nil {
++				return
++			}
+ 			req, err := http.NewRequest("GET", task.URL, nil)
+ 			if err != nil {
+-				task.Error = err
++				task.setError(err)
+ 				return
+ 			}
+ 			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+ 
+ 			resp, err := d.client.Do(req)
+ 			if err != nil {
+-				task.Error = err
++				task.setError(err)
+ 				return
+ 			}
+ 			defer resp.Body.Close()
++			if resp.StatusCode != http.StatusPartialContent {
++				task.setError(fmt.Errorf("服务器未按 Range 返回分片：HTTP %d", resp.StatusCode))
++				return
++			}
++			responseStart, responseEnd, total, err := parseContentRange(resp.Header.Get("Content-Range"))
++			if err != nil || responseStart != start || responseEnd != end || total != task.TotalSize {
++				task.setError(fmt.Errorf("分片范围不匹配：请求 %d-%d，返回 %q", start, end,
++					resp.Header.Get("Content-Range")))
++				return
++			}
++			if err := validateMediaResponse(resp); err != nil {
++				task.setError(err)
++				return
++			}
+ 
+ 			buf := make([]byte, 32*1024)
+ 			offset := start
+ 			for {
++				if task.getError() != nil {
++					return
++				}
+ 				if task.isPaused.Load() {
+ 					time.Sleep(100 * time.Millisecond)
+ 					continue
+ 				}
+ 				n, err := resp.Body.Read(buf)
+ 				if n > 0 {
++					if offset+int64(n) > end+1 {
++						task.setError(fmt.Errorf("分片 %d-%d 返回数据超出范围", start, end))
++						return
++					}
+ 					_, err = file.WriteAt(buf[:n], offset)
+ 					if err != nil {
+-						task.Error = err
++						task.setError(err)
+ 						return
+ 					}
+ 					offset += int64(n)
+ 					atomic.AddInt64(&task.Downloaded, int64(n))
+ 				}
+ 				if err == io.EOF {
++					if offset != end+1 {
++						task.setError(fmt.Errorf("分片 %d-%d 不完整：收到 %d 字节", start, end, offset-start))
++					}
+ 					break
+ 				}
+ 				if err != nil {
+-					task.Error = err
++					task.setError(err)
+ 					return
+ 				}
+ 			}
+@@ -397,13 +504,16 @@ func (d *Downloader) downloadMultiThread(task *DownloadTask) error {
+ 
+ 	wg.Wait()
+ 
+-	if task.Error == nil {
++	if task.getError() == nil && atomic.LoadInt64(&task.Downloaded) == task.TotalSize {
++		succeeded = true
+ 		task.SetStatus("completed")
+ 		if task.progress != nil {
+-			task.progress(100, "Completed", atomic.LoadInt64(&task.TotalSize), atomic.LoadInt64(&task.TotalSize))
++			task.progress(100, "Completed", task.TotalSize, task.TotalSize)
+ 		}
++	} else if task.getError() == nil {
++		task.setError(fmt.Errorf("视频文件不完整：收到 %d/%d 字节", atomic.LoadInt64(&task.Downloaded), task.TotalSize))
+ 	}
+-	return task.Error
++	return task.getError()
+ }
+ 
+ func (d *Downloader) downloadSingleThread(task *DownloadTask) error {
+@@ -412,12 +522,27 @@ func (d *Downloader) downloadSingleThread(task *DownloadTask) error {
+ 		return err
+ 	}
+ 	defer resp.Body.Close()
++	if err := validateMediaResponse(resp); err != nil {
++		return err
++	}
++	if resp.StatusCode != http.StatusOK {
++		return fmt.Errorf("视频下载失败：HTTP %d", resp.StatusCode)
++	}
++	if resp.ContentLength > 0 {
++		task.TotalSize = resp.ContentLength
++	}
+ 
+ 	file, err := utils.CreateFile(task.FilePath)
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer file.Close()
++	succeeded := false
++	defer func() {
++		_ = file.Close()
++		if !succeeded {
++			_ = utils.RemoveFile(task.FilePath)
++		}
++	}()
+ 
+ 	task.SetStatus("downloading")
+ 	task.StartTime = time.Now()
+@@ -448,10 +573,36 @@ func (d *Downloader) downloadSingleThread(task *DownloadTask) error {
+ 			return err
+ 		}
+ 	}
++	if task.TotalSize > 0 && atomic.LoadInt64(&task.Downloaded) != task.TotalSize {
++		return fmt.Errorf("视频文件不完整：收到 %d/%d 字节", atomic.LoadInt64(&task.Downloaded), task.TotalSize)
++	}
+ 
++	succeeded = true
+ 	task.SetStatus("completed")
+ 	if task.progress != nil {
+-		task.progress(100, "Completed", task.Downloaded, task.TotalSize)
++		task.progress(100, "Completed", atomic.LoadInt64(&task.Downloaded), task.TotalSize)
++	}
++	return nil
++}
++
++func parseContentRange(value string) (int64, int64, int64, error) {
++	var start, end, total int64
++	if _, err := fmt.Sscanf(strings.TrimSpace(value), "bytes %d-%d/%d", &start, &end, &total); err != nil {
++		return 0, 0, 0, err
++	}
++	if start < 0 || end < start || total <= end {
++		return 0, 0, 0, fmt.Errorf("invalid Content-Range")
++	}
++	return start, end, total, nil
++}
++
++func validateMediaResponse(resp *http.Response) error {
++	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
++		return fmt.Errorf("媒体服务器返回 HTTP %d", resp.StatusCode)
++	}
++	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
++	if strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/json") {
++		return fmt.Errorf("媒体服务器返回了非视频内容（%s）", contentType)
+ 	}
+ 	return nil
+ }
+@@ -464,6 +615,10 @@ func (task *DownloadTask) Resume() {
+ 	task.isPaused.Store(false)
+ }
+ 
++func (task *DownloadTask) IsPaused() bool {
++	return task.isPaused.Load()
++}
++
+ func (task *DownloadTask) Cancel() {
+ 	if task.cancelFunc != nil {
+ 		task.cancelFunc()
+diff --git a/downloader/m3u8_downloader.go b/downloader/m3u8_downloader.go
+index ce85536..3a14fb7 100644
+--- a/downloader/m3u8_downloader.go
++++ b/downloader/m3u8_downloader.go
+@@ -4,9 +4,12 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
++	"regexp"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+@@ -18,6 +21,9 @@ import (
+ func (d *Downloader) downloadM3U8(task *DownloadTask) error {
+ 	task.SetStatus("preparing")
+ 	task.StartTime = time.Now()
++	atomic.StoreInt64(&task.Downloaded, 0)
++	atomic.StoreInt64(&task.DownloadedParts, 0)
++	task.clearError()
+ 
+ 	// 创建临时目录
+ 	tmpDir := filepath.Join(filepath.Dir(task.FilePath), fmt.Sprintf(".tmp_%d_%s", time.Now().UnixNano(), filepath.Base(task.FilePath)))
+@@ -26,82 +32,72 @@ func (d *Downloader) downloadM3U8(task *DownloadTask) error {
+ 	if err := utils.Mkdir(tmpDir); err != nil {
+ 		return err
+ 	}
++	defer func() {
++		if utils.IsAndroid() {
++			_ = os.RemoveAll(utils.GetAndroidSafeFilePath(tmpDir))
++		} else {
++			_ = os.RemoveAll(tmpDir)
++		}
++	}()
+ 
+-	// 获取m3u8内容
+-	resp, err := d.client.Get(task.URL)
+-	if err != nil {
+-		return err
+-	}
+-	defer resp.Body.Close()
+-
+-	body, err := io.ReadAll(resp.Body)
++	segmentURLs, err := loadHLSMediaPlaylist(d.client, task.URL, 0)
+ 	if err != nil {
+ 		return err
+ 	}
+-
+-	lines := strings.Split(string(body), "\n")
+-	var tsList []string
+-	baseURL := task.URL[:strings.LastIndex(task.URL, "/")+1]
+-	for _, line := range lines {
+-		line = strings.TrimSpace(line)
+-		if line != "" && !strings.HasPrefix(line, "#") {
+-			if !strings.HasPrefix(line, "http") {
+-				line = baseURL + line
+-			}
+-			tsList = append(tsList, line)
+-		}
++	if len(segmentURLs) == 0 {
++		return fmt.Errorf("M3U8 播放列表中没有媒体分片")
+ 	}
+-
+-	task.TotalSize = int64(len(tsList))
+ 	task.SetStatus("downloading")
+ 
+ 	// 使用负数存储总段数，便于进度管理器识别M3U8任务
+-	task.TotalSize = -int64(len(tsList))
++	task.TotalSize = -int64(len(segmentURLs))
+ 
+ 	// 将任务添加到进度管理器
+ 	d.progressManager.AddTask(task)
++	defer d.progressManager.RemoveTask(task)
+ 
+ 	var wg sync.WaitGroup
+ 	concurrency := d.perFileThreads
++	if concurrency < 1 {
++		concurrency = 1
++	}
+ 	sem := make(chan struct{}, concurrency)
+ 
+-	for idx, tsURL := range tsList {
++	errorChannel := make(chan error, len(segmentURLs))
++	for idx, segmentURL := range segmentURLs {
+ 		wg.Add(1)
+ 		sem <- struct{}{}
+-		go func(i int, url string) {
++		go func(i int, rawURL string) {
+ 			defer wg.Done()
+ 			defer func() { <-sem }()
+ 
+ 			filePath := filepath.Join(tmpDir, fmt.Sprintf("%05d.ts", i))
++			var lastError error
+ 			for attempt := 0; attempt < 3; attempt++ {
+-				err := downloadTS(d.client, url, filePath, task)
+-				if err == nil {
++				lastError = downloadTS(d.client, rawURL, filePath, task)
++				if lastError == nil {
+ 					atomic.AddInt64(&task.DownloadedParts, 1)
+ 					return
+ 				}
+-				time.Sleep(time.Second)
++				if attempt < 2 {
++					time.Sleep(time.Second)
++				}
+ 			}
+-		}(idx, tsURL)
++			errorChannel <- fmt.Errorf("分片 %d 下载失败：%w", i+1, lastError)
++		}(idx, segmentURL)
+ 	}
+ 
+ 	wg.Wait()
++	close(errorChannel)
++	if err := <-errorChannel; err != nil {
++		return err
++	}
+ 
+ 	// 进入合并阶段，进度管理器会自动显示90%进度
+ 	task.SetStatus("merging")
+ 
+ 	// 合并TS文件
+-	err = mergeTSFiles(tmpDir, task.FilePath)
+-
+-	// 清理临时目录（这也是合并过程的一部分）
+-	if utils.IsAndroid() {
+-		actualPath := utils.GetAndroidSafeFilePath(tmpDir)
+-		os.RemoveAll(actualPath)
+-	} else {
+-		os.RemoveAll(tmpDir)
+-	}
+-
+-	// 合并和清理都完成后，先从进度管理器移除任务，再设置完成状态
+-	d.progressManager.RemoveTask(task)
++	err = mergeTSFiles(tmpDir, task.FilePath, len(segmentURLs))
+ 
+ 	if err == nil {
+ 		task.SetStatus("completed")
+@@ -131,6 +127,9 @@ func downloadTS(client *http.Client, url, filePath string, task *DownloadTask) e
+ 		return err
+ 	}
+ 	defer resp.Body.Close()
++	if err := validateMediaResponse(resp); err != nil {
++		return err
++	}
+ 
+ 	out, err := utils.CreateFile(filePath)
+ 	if err != nil {
+@@ -169,12 +168,18 @@ func downloadTS(client *http.Client, url, filePath string, task *DownloadTask) e
+ 	return nil
+ }
+ 
+-func mergeTSFiles(tmpDir, outputFile string) error {
++func mergeTSFiles(tmpDir, outputFile string, expectedFiles int) error {
+ 	out, err := utils.CreateFile(outputFile)
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer out.Close()
++	succeeded := false
++	defer func() {
++		_ = out.Close()
++		if !succeeded {
++			_ = utils.RemoveFile(outputFile)
++		}
++	}()
+ 
+ 	// 获取实际的临时目录路径
+ 	actualTmpDir := tmpDir
+@@ -195,6 +200,9 @@ func mergeTSFiles(tmpDir, outputFile string) error {
+ 		}
+ 	}
+ 	sort.Strings(tsFiles)
++	if len(tsFiles) != expectedFiles {
++		return fmt.Errorf("媒体分片不完整：找到 %d/%d 个", len(tsFiles), expectedFiles)
++	}
+ 
+ 	for _, name := range tsFiles {
+ 		path := filepath.Join(actualTmpDir, name)
+@@ -208,5 +216,128 @@ func mergeTSFiles(tmpDir, outputFile string) error {
+ 			return err
+ 		}
+ 	}
+-	return out.Sync()
++	if err := out.Sync(); err != nil {
++		return err
++	}
++	succeeded = true
++	return nil
++}
++
++type hlsVariant struct {
++	url       string
++	bandwidth int64
++}
++
++var (
++	hlsBandwidthPattern = regexp.MustCompile(`(?i)(?:^|,)\s*BANDWIDTH=(\d+)`)
++	hlsURIAttribute     = regexp.MustCompile(`(?i)(?:^|,)\s*URI="([^"]+)"`)
++)
++
++func loadHLSMediaPlaylist(client *http.Client, rawURL string, depth int) ([]string, error) {
++	if depth > 4 {
++		return nil, fmt.Errorf("M3U8 播放列表嵌套过深")
++	}
++
++	resp, err := client.Get(rawURL)
++	if err != nil {
++		return nil, err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
++		return nil, fmt.Errorf("M3U8 请求失败：HTTP %d", resp.StatusCode)
++	}
++	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
++	if err != nil {
++		return nil, err
++	}
++	if !strings.Contains(string(body), "#EXTM3U") {
++		return nil, fmt.Errorf("服务器返回的不是有效 M3U8 播放列表")
++	}
++
++	lines := strings.Split(string(body), "\n")
++	segments := make([]string, 0)
++	variants := make([]hlsVariant, 0)
++	pendingBandwidth := int64(-1)
++
++	for _, rawLine := range lines {
++		line := strings.TrimSpace(rawLine)
++		if line == "" {
++			continue
++		}
++		upperLine := strings.ToUpper(line)
++		if strings.HasPrefix(upperLine, "#EXT-X-KEY:") && !strings.Contains(upperLine, "METHOD=NONE") {
++			return nil, fmt.Errorf("暂不支持加密的 HLS 回放")
++		}
++		if strings.HasPrefix(upperLine, "#EXT-X-MAP:") {
++			match := hlsURIAttribute.FindStringSubmatch(line[strings.Index(line, ":")+1:])
++			if len(match) == 2 {
++				resolved, err := resolveHLSURL(rawURL, match[1])
++				if err != nil {
++					return nil, err
++				}
++				segments = append(segments, resolved)
++			}
++			continue
++		}
++		if strings.HasPrefix(upperLine, "#EXT-X-STREAM-INF:") {
++			pendingBandwidth = 0
++			if match := hlsBandwidthPattern.FindStringSubmatch(line[strings.Index(line, ":")+1:]); len(match) == 2 {
++				pendingBandwidth, _ = strconv.ParseInt(match[1], 10, 64)
++			}
++			continue
++		}
++		if strings.HasPrefix(line, "#") {
++			continue
++		}
++
++		resolved, err := resolveHLSURL(rawURL, line)
++		if err != nil {
++			return nil, err
++		}
++		if pendingBandwidth >= 0 {
++			variants = append(variants, hlsVariant{url: resolved, bandwidth: pendingBandwidth})
++			pendingBandwidth = -1
++			continue
++		}
++		segments = append(segments, resolved)
++	}
++
++	if len(variants) > 0 {
++		sort.SliceStable(variants, func(i, j int) bool {
++			if variants[i].bandwidth != variants[j].bandwidth {
++				return variants[i].bandwidth > variants[j].bandwidth
++			}
++			return variants[i].url < variants[j].url
++		})
++		return loadHLSMediaPlaylist(client, variants[0].url, depth+1)
++	}
++
++	if len(segments) == 1 && strings.Contains(strings.ToLower(segments[0]), ".m3u8") {
++		return loadHLSMediaPlaylist(client, segments[0], depth+1)
++	}
++	return segments, nil
++}
++
++func resolveHLSURL(baseURL, reference string) (string, error) {
++	base, err := url.Parse(baseURL)
++	if err != nil {
++		return "", err
++	}
++	ref, err := url.Parse(reference)
++	if err != nil {
++		return "", err
++	}
++	resolved := base.ResolveReference(ref)
++	baseQuery := base.Query()
++	resolvedQuery := resolved.Query()
++	for key, values := range baseQuery {
++		if _, exists := resolvedQuery[key]; exists {
++			continue
++		}
++		for _, value := range values {
++			resolvedQuery.Add(key, value)
++		}
++	}
++	resolved.RawQuery = resolvedQuery.Encode()
++	return resolved.String(), nil
+ }
+diff --git a/models/global.go b/models/global.go
+index ce5ea30..f5f4fbb 100644
+--- a/models/global.go
++++ b/models/global.go
+@@ -1,5 +1,12 @@
+ package models
+ 
++import (
++	"bytes"
++	"encoding/json"
++	"fmt"
++	"strings"
++)
++
+ type AuthData struct {
+ 	Token    string
+ 	UserID   string
+@@ -7,19 +14,163 @@ type AuthData struct {
+ }
+ 
+ type Course struct {
+-	CourseID    string `json:"stdCourseId"`
+-	TutorID     string `json:"tutorId"`
+-	CourseName  string `json:"courseName"`
+-	SubjectName string `json:"subjectName"`
+-	EndLiveNum  int    `json:"endLiveNum"`
++	CourseID      string         `json:"stdCourseId"`
++	TutorID       string         `json:"tutorId"`
++	CourseName    string         `json:"courseName"`
++	SubjectName   string         `json:"subjectName"`
++	EndLiveNum    int            `json:"endLiveNum"`
++	SourceCourses []CourseSource `json:"-"`
++}
++
++// CourseSource keeps every server-side enrollment behind one logical course.
++// Class transfers can leave several stdCourseId values with the same course
++// metadata; the first server-ordered entry remains the primary source and the
++// remaining entries are available as download fallbacks.
++type CourseSource struct {
++	CourseID string
++	TutorID  string
++}
++
++func (course *Course) Sources() []CourseSource {
++	if course == nil {
++		return nil
++	}
++
++	sources := make([]CourseSource, 0, len(course.SourceCourses)+1)
++	seen := make(map[string]struct{})
++	add := func(source CourseSource) {
++		if source.CourseID == "" {
++			return
++		}
++		key := source.CourseID + "\x00" + source.TutorID
++		if _, exists := seen[key]; exists {
++			return
++		}
++		seen[key] = struct{}{}
++		sources = append(sources, source)
++	}
++	add(CourseSource{CourseID: course.CourseID, TutorID: course.TutorID})
++	for _, source := range course.SourceCourses {
++		add(source)
++	}
++	return sources
+ }
+ 
+ type Lecture struct {
+-	LiveID         int    `json:"liveId"`
+-	LiveTypeString string `json:"liveTypeString"`
+-	ClassID        string `json:"stdClassId"`
+-	SubjectID      string `json:"stdSubject"`
+-	LecturerID     string `json:"lecturerId"`
++	LiveID         int           `json:"liveId"`
++	LiveTypeString string        `json:"liveTypeString"`
++	ClassID        string        `json:"stdClassId"`
++	SubjectID      string        `json:"stdSubject"`
++	LecturerID     string        `json:"lecturerId"`
++	Tasks          []LectureTask `json:"tasks"`
++
++	// ListIndex and DisplayName are derived from the lecture-list response.
++	// They let the UI keep the exact lecture selected by the user instead of
++	// translating it back to a fragile array index later.
++	ListIndex   int    `json:"-"`
++	DisplayName string `json:"-"`
++
++	// SourceCourseID/SourceTutorID identify the exact enrollment that produced
++	// this lecture. Alternates are the same logical lecture from older transfer
++	// records and are only tried when the primary source cannot resolve a video.
++	SourceCourseID string     `json:"-"`
++	SourceTutorID  string     `json:"-"`
++	Alternates     []*Lecture `json:"-"`
++}
++
++type LectureTask struct {
++	CurriculumID FlexibleID `json:"curriculumId"`
++	TaskID       FlexibleID `json:"taskId"`
++	CoursewareID FlexibleID `json:"coursewareId"`
++}
++
++// FlexibleID accepts both JSON strings and numbers without losing precision.
++// The TAL APIs have historically used both representations for identifiers.
++type FlexibleID string
++
++func (id *FlexibleID) UnmarshalJSON(data []byte) error {
++	data = bytes.TrimSpace(data)
++	if len(data) == 0 || bytes.Equal(data, []byte("null")) {
++		*id = ""
++		return nil
++	}
++
++	if data[0] == '"' {
++		var value string
++		if err := json.Unmarshal(data, &value); err != nil {
++			return err
++		}
++		*id = FlexibleID(value)
++		return nil
++	}
++
++	var number json.Number
++	if err := json.Unmarshal(data, &number); err != nil {
++		return fmt.Errorf("invalid identifier %q: %w", string(data), err)
++	}
++	*id = FlexibleID(number.String())
++	return nil
++}
++
++func (id FlexibleID) String() string {
++	return string(id)
++}
++
++func (lecture *Lecture) UnmarshalJSON(data []byte) error {
++	type lectureAlias Lecture
++	var decoded lectureAlias
++	if err := json.Unmarshal(data, &decoded); err != nil {
++		return err
++	}
++	*lecture = Lecture(decoded)
++
++	var fields map[string]json.RawMessage
++	if err := json.Unmarshal(data, &fields); err != nil {
++		return err
++	}
++
++	// Different TAL deployments have used different names for the lesson title.
++	// Keep the wire model tolerant while still showing the server-provided title
++	// whenever one is present.
++	for _, key := range []string{
++		"liveName", "lessonName", "lectureName", "taskName", "title", "name",
++	} {
++		var value string
++		if raw, ok := fields[key]; ok && json.Unmarshal(raw, &value) == nil {
++			value = strings.TrimSpace(value)
++			if value != "" {
++				lecture.DisplayName = value
++				break
++			}
++		}
++	}
++
++	return nil
++}
++
++func (lecture *Lecture) StableKey() string {
++	if lecture == nil {
++		return ""
++	}
++	return fmt.Sprintf("%d|%s|%s|%s|%d", lecture.LiveID, lecture.ClassID,
++		lecture.SubjectID, lecture.LiveTypeString, lecture.ListIndex)
++
++}
++
++func (lecture *Lecture) Label() string {
++	if lecture == nil {
++		return "未知课节"
++	}
++
++	index := lecture.ListIndex
++	if index <= 0 {
++		index = 1
++	}
++	label := fmt.Sprintf("第%d讲", index)
++	if lecture.DisplayName != "" && lecture.DisplayName != label {
++		label += " - " + lecture.DisplayName
++	}
++	return label
+ }
+ 
+ type StudentAccount struct {
+diff --git a/models/response.go b/models/response.go
+index 5e65e08..f09803a 100644
+--- a/models/response.go
++++ b/models/response.go
+@@ -25,3 +25,12 @@ type RecordModeVideoUrlResponse struct {
+ 	Definitions map[string][]string `json:"definitions"`
+ 	Message     string              `json:"message"`
+ }
++
++type OnlineRecordAuthResponse struct {
++	InitData struct {
++		Task struct {
++			RealRecordID FlexibleID `json:"realRecordId"`
++		} `json:"task"`
++	} `json:"initData"`
++	Message string `json:"message"`
++}
+diff --git a/ui/course_select.go b/ui/course_select.go
+index e0996fe..a1e0459 100644
+--- a/ui/course_select.go
++++ b/ui/course_select.go
+@@ -3,6 +3,7 @@ package ui
+ import (
+ 	"fmt"
+ 	"path/filepath"
++	"sync"
+ 
+ 	"github.com/itsHenry35/tal_downloader/config"
+ 	"github.com/itsHenry35/tal_downloader/models"
+@@ -24,7 +25,10 @@ type CourseSelectionScreen struct {
+ 	overwriteCheck    *widget.Check
+ 	container         *fyne.Container
+ 	courseList        *fyne.Container
+-	lectureSelections map[string][]int // courseID -> selected lecture indices
++	lectureSelections map[string][]*models.Lecture
++	lectureCache      map[string][]*models.Lecture
++	selectionSet      map[string]bool
++	lectureMutex      sync.RWMutex
+ }
+ 
+ func getDownloadFolderName() string {
+@@ -41,7 +45,9 @@ func NewCourseSelectionScreen(manager *Manager) fyne.CanvasObject {
+ 	cs := &CourseSelectionScreen{
+ 		manager:           manager,
+ 		courseChecks:      make(map[string]*widget.Check),
+-		lectureSelections: make(map[string][]int),
++		lectureSelections: make(map[string][]*models.Lecture),
++		lectureCache:      make(map[string][]*models.Lecture),
++		selectionSet:      make(map[string]bool),
+ 		downloadPath:      downloadPath,
+ 	}
+ 	cs.loadCourses()
+@@ -114,24 +120,20 @@ func (cs *CourseSelectionScreen) buildUI() {
+ 
+ 	selectAllButton := widget.NewButton("全选", func() {
+ 		for courseID, check := range cs.courseChecks {
++			cs.lectureMutex.Lock()
++			delete(cs.lectureSelections, courseID)
++			delete(cs.selectionSet, courseID)
++			cs.lectureMutex.Unlock()
+ 			check.SetChecked(true)
+-			// 获取对应课程的讲数并全选
+-			for _, course := range cs.courses {
+-				if course.CourseID == courseID {
+-					lectures := make([]int, course.EndLiveNum)
+-					for i := range lectures {
+-						lectures[i] = i
+-					}
+-					cs.lectureSelections[courseID] = lectures
+-					break
+-				}
+-			}
+ 		}
+ 	})
+ 	deselectAllButton := widget.NewButton("取消全选", func() {
+ 		for courseID, check := range cs.courseChecks {
+ 			check.SetChecked(false)
+-			cs.lectureSelections[courseID] = []int{}
++			cs.lectureMutex.Lock()
++			delete(cs.lectureSelections, courseID)
++			delete(cs.selectionSet, courseID)
++			cs.lectureMutex.Unlock()
+ 		}
+ 	})
+ 
+@@ -192,28 +194,20 @@ func (cs *CourseSelectionScreen) updateCourseList() {
+ 	for _, course := range cs.courses {
+ 		courseCopy := course // 避免闭包问题
+ 
+-		check := widget.NewCheck(course.SubjectName+" - "+course.CourseName, func(checked bool) {
+-			if checked && len(cs.lectureSelections[courseCopy.CourseID]) == 0 {
+-				// 如果勾选但没有选择讲数，默认全选
+-				lectures := make([]int, courseCopy.EndLiveNum)
+-				for i := range lectures {
+-					lectures[i] = i
+-				}
+-				cs.lectureSelections[courseCopy.CourseID] = lectures
+-			} else if !checked {
+-				// 取消勾选时清空选择
+-				cs.lectureSelections[courseCopy.CourseID] = []int{}
++		check := widget.NewCheck(cs.courseLabel(courseCopy), func(checked bool) {
++			if checked {
++				return
++			}
++			cs.lectureMutex.Lock()
++			delete(cs.lectureSelections, courseCopy.CourseID)
++			delete(cs.selectionSet, courseCopy.CourseID)
++			cs.lectureMutex.Unlock()
++			if courseCheck, ok := cs.courseChecks[courseCopy.CourseID]; ok {
++				courseCheck.SetText(cs.courseLabel(courseCopy))
+ 			}
+ 		})
+ 		cs.courseChecks[course.CourseID] = check
+ 
+-		// 默认全选所有讲
+-		lectures := make([]int, course.EndLiveNum)
+-		for i := range lectures {
+-			lectures[i] = i
+-		}
+-		cs.lectureSelections[course.CourseID] = lectures
+-
+ 		// 创建选择讲数的按钮
+ 		selectLecturesBtn := widget.NewButton("...", func() {
+ 			cs.showLectureSelectionDialog(courseCopy)
+@@ -227,19 +221,48 @@ func (cs *CourseSelectionScreen) updateCourseList() {
+ }
+ 
+ func (cs *CourseSelectionScreen) showLectureSelectionDialog(course *models.Course) {
+-	// 创建讲数选择列表
+-	lectureChecks := make([]*widget.Check, course.EndLiveNum)
+-	selectedLectures := cs.lectureSelections[course.CourseID]
+-
+-	// 创建一个map来快速查找已选中的讲
+-	selectedMap := make(map[int]bool)
+-	for _, idx := range selectedLectures {
+-		selectedMap[idx] = true
++	progressDialog := dialog.NewProgressInfinite("加载中...", "正在获取实际课节列表", cs.manager.window)
++	progressDialog.Show()
++
++	go func() {
++		lectures, err := cs.loadLectures(course)
++		fyne.Do(func() {
++			progressDialog.Dismiss()
++			if err != nil {
++				dialog.ShowError(err, cs.manager.window)
++				return
++			}
++			cs.showLoadedLectureSelectionDialog(course, lectures)
++		})
++	}()
++}
++
++func (cs *CourseSelectionScreen) showLoadedLectureSelectionDialog(course *models.Course, lectures []*models.Lecture) {
++	if len(lectures) == 0 {
++		dialog.ShowInformation("提示", "该课程暂时没有可下载课节", cs.manager.window)
++		return
++	}
++
++	cs.lectureMutex.RLock()
++	selectedLectures := append([]*models.Lecture(nil), cs.lectureSelections[course.CourseID]...)
++	selectionConfigured := cs.selectionSet[course.CourseID]
++	cs.lectureMutex.RUnlock()
++
++	selectedMap := make(map[string]bool)
++	if selectionConfigured {
++		for _, lecture := range selectedLectures {
++			selectedMap[lecture.StableKey()] = true
++		}
++	} else if check, ok := cs.courseChecks[course.CourseID]; ok && check.Checked {
++		for _, lecture := range lectures {
++			selectedMap[lecture.StableKey()] = true
++		}
+ 	}
+ 
+-	for i := 0; i < course.EndLiveNum; i++ {
+-		lectureChecks[i] = widget.NewCheck(fmt.Sprintf("第%d讲", i+1), nil)
+-		lectureChecks[i].SetChecked(selectedMap[i])
++	lectureChecks := make([]*widget.Check, len(lectures))
++	for i, lecture := range lectures {
++		lectureChecks[i] = widget.NewCheck(lecture.Label(), nil)
++		lectureChecks[i].SetChecked(selectedMap[lecture.StableKey()])
+ 	}
+ 
+ 	// 创建滚动容器
+@@ -268,25 +291,30 @@ func (cs *CourseSelectionScreen) showLectureSelectionDialog(course *models.Cours
+ 
+ 	confirmBtn := widget.NewButton("确定", func() {
+ 		// 收集选中的讲
+-		var selected []int
++		var selected []*models.Lecture
+ 		for i, check := range lectureChecks {
+ 			if check.Checked {
+-				selected = append(selected, i)
++				selected = append(selected, lectures[i])
+ 			}
+ 		}
++		cs.lectureMutex.Lock()
+ 		cs.lectureSelections[course.CourseID] = selected
++		cs.selectionSet[course.CourseID] = true
++		cs.lectureMutex.Unlock()
+ 
+ 		// 更新主复选框状态
+ 		if check, ok := cs.courseChecks[course.CourseID]; ok {
+ 			if len(selected) == 0 {
+ 				check.SetChecked(false)
+-			} else if len(selected) == course.EndLiveNum {
++				check.SetText(cs.courseLabel(course))
++			} else if len(selected) == len(lectures) {
+ 				check.SetChecked(true)
++				check.SetText(cs.courseLabel(course))
+ 			} else {
+ 				// 部分选中状态 - Fyne不支持三态复选框，所以保持勾选但修改文本提示
+ 				check.SetChecked(true)
+ 				check.Text = fmt.Sprintf("%s - %s (已选%d/%d讲)",
+-					course.SubjectName, course.CourseName, len(selected), course.EndLiveNum)
++					course.SubjectName, course.CourseName, len(selected), len(lectures))
+ 				check.Refresh()
+ 			}
+ 		}
+@@ -319,14 +347,10 @@ func (cs *CourseSelectionScreen) showLectureSelectionDialog(course *models.Cours
+ 
+ func (cs *CourseSelectionScreen) startDownload() {
+ 	var selectedCourses []*models.Course
+-	selectedLectures := make(map[string][]int)
+ 
+ 	for _, course := range cs.courses {
+ 		if check, ok := cs.courseChecks[course.CourseID]; ok && check.Checked {
+-			if lectures, ok := cs.lectureSelections[course.CourseID]; ok && len(lectures) > 0 {
+-				selectedCourses = append(selectedCourses, course)
+-				selectedLectures[course.CourseID] = lectures
+-			}
++			selectedCourses = append(selectedCourses, course)
+ 		}
+ 	}
+ 
+@@ -335,19 +359,102 @@ func (cs *CourseSelectionScreen) startDownload() {
+ 		return
+ 	}
+ 
+-	if err := utils.Mkdir(cs.downloadPath); err != nil {
+-		utils.ShowErrorDialog(err, cs.manager.window)
+-		return
++	downloadPath := cs.downloadPath
++	isExtensive := cs.extensiveCheck.Checked
++	isOverwrite := !utils.IsAndroid() && cs.overwriteCheck.Checked
++	progressDialog := dialog.NewProgressInfinite("加载中...", "正在确认所选课节", cs.manager.window)
++	progressDialog.Show()
++
++	go func() {
++		resolvedCourses := make([]*models.Course, 0, len(selectedCourses))
++		resolvedLectures := make(map[string][]*models.Lecture)
++
++		for _, course := range selectedCourses {
++			course := course
++			lectures, err := cs.loadLectures(course)
++			if err != nil {
++				fyne.Do(func() {
++					progressDialog.Dismiss()
++					dialog.ShowError(fmt.Errorf("%s：%w", course.CourseName, err), cs.manager.window)
++				})
++				return
++			}
++
++			cs.lectureMutex.RLock()
++			configured := cs.selectionSet[course.CourseID]
++			selected := append([]*models.Lecture(nil), cs.lectureSelections[course.CourseID]...)
++			cs.lectureMutex.RUnlock()
++
++			if configured {
++				selectedKeys := make(map[string]bool, len(selected))
++				for _, lecture := range selected {
++					selectedKeys[lecture.StableKey()] = true
++				}
++				selected = selected[:0]
++				for _, lecture := range lectures {
++					if selectedKeys[lecture.StableKey()] {
++						selected = append(selected, lecture)
++					}
++				}
++			} else {
++				selected = append([]*models.Lecture(nil), lectures...)
++			}
++
++			if len(selected) > 0 {
++				resolvedCourses = append(resolvedCourses, course)
++				resolvedLectures[course.CourseID] = selected
++			}
++		}
++
++		if len(resolvedCourses) == 0 {
++			fyne.Do(func() {
++				progressDialog.Dismiss()
++				dialog.ShowInformation("提示", "所选课程没有可下载课节", cs.manager.window)
++			})
++			return
++		}
++		if err := utils.Mkdir(downloadPath); err != nil {
++			fyne.Do(func() {
++				progressDialog.Dismiss()
++				dialog.ShowError(err, cs.manager.window)
++			})
++			return
++		}
++
++		fyne.Do(func() {
++			progressDialog.Dismiss()
++			cs.manager.selectedCourses = resolvedCourses
++			cs.manager.selectedLectures = resolvedLectures
++			cs.manager.downloadPath = downloadPath
++			cs.manager.isExtensive = isExtensive
++			cs.manager.isOverwrite = isOverwrite
++			cs.manager.ShowDownloadProgress()
++		})
++	}()
++}
++
++func (cs *CourseSelectionScreen) loadLectures(course *models.Course) ([]*models.Lecture, error) {
++	if course == nil {
++		return nil, fmt.Errorf("课程信息为空")
++	}
++	courseID := course.CourseID
++	cs.lectureMutex.RLock()
++	lectures, ok := cs.lectureCache[courseID]
++	cs.lectureMutex.RUnlock()
++	if ok {
++		return lectures, nil
+ 	}
+ 
+-	cs.manager.selectedCourses = selectedCourses
+-	cs.manager.selectedLectures = selectedLectures
+-	cs.manager.downloadPath = cs.downloadPath
+-	cs.manager.isExtensive = cs.extensiveCheck.Checked
+-	if utils.IsAndroid() {
+-		cs.manager.isOverwrite = false
+-	} else {
+-		cs.manager.isOverwrite = cs.overwriteCheck.Checked
++	lectures, err := cs.manager.apiClient.GetCourseLectures(course)
++	if err != nil {
++		return nil, err
+ 	}
+-	cs.manager.ShowDownloadProgress()
++	cs.lectureMutex.Lock()
++	cs.lectureCache[courseID] = lectures
++	cs.lectureMutex.Unlock()
++	return lectures, nil
++}
++
++func (cs *CourseSelectionScreen) courseLabel(course *models.Course) string {
++	return course.SubjectName + " - " + course.CourseName
+ }
+diff --git a/ui/download_progress.go b/ui/download_progress.go
+index 5f59886..1eed3e2 100644
+--- a/ui/download_progress.go
++++ b/ui/download_progress.go
+@@ -176,6 +176,14 @@ func (ds *DownloadProgressScreen) applyProgressUpdate(update ProgressUpdate) {
+ 				}
+ 			} else {
+ 				speedLabel.SetText(fmt.Sprintf("下载速度: %s", speed))
++				if hasPauseBtn {
++					ds.tasksMutex.RLock()
++					task := ds.taskMap[filePath]
++					ds.tasksMutex.RUnlock()
++					if task != nil && !task.IsPaused() {
++						pauseBtn.SetText("暂停")
++					}
++				}
+ 			}
+ 		}
+ 	}
+@@ -276,9 +284,9 @@ func (ds *DownloadProgressScreen) startDownloads() {
+ 			progressList.Add(widget.NewSeparator())
+ 		}
+ 
+-		// 获取选中的讲
+-		selectedLectureIndices := ds.manager.selectedLectures[course.CourseID]
+-		selectedCount := len(selectedLectureIndices)
++		// 这里保存的是用户实际选择的课节对象，不再保存数组下标。
++		selectedLectures := ds.manager.selectedLectures[course.CourseID]
++		selectedCount := len(selectedLectures)
+ 
+ 		// 添加课程标题
+ 		courseLabel := widget.NewLabelWithStyle(
+@@ -303,76 +311,69 @@ func (ds *DownloadProgressScreen) startDownloads() {
+ 		))
+ 
+ 		wg.Add(1)
+-		go func(course *models.Course, courseDir string, selectedIndices []int) {
++		go func(course *models.Course, courseDir string, lectures []*models.Lecture) {
+ 			defer wg.Done()
+ 
+-			lectures, err := ds.manager.apiClient.GetLectures(course.CourseID)
+-			if err != nil {
+-				utils.ShowErrorDialog(err, ds.manager.window)
+-				return
+-			}
+-
+-			// 创建选中索引的map以便快速查找
+-			selectedMap := make(map[int]bool)
+-			for _, idx := range selectedIndices {
+-				selectedMap[idx] = true
+-			}
+-
+-			// 只下载选中的讲，并且不超过endLiveNum
+ 			for j, lecture := range lectures {
+-				// 跳过未选中的讲
+-				if !selectedMap[j] {
++				if lecture == nil {
+ 					continue
+ 				}
+ 
+-				// 确保不超过已结束的讲数
+-				if j >= course.EndLiveNum {
+-					fyne.Do(func() {
+-						ds.addErrorItem(course.CourseID, fmt.Sprintf("第%d讲", j+1), "该讲尚未开始")
+-					})
+-					continue
++				lectureNumber := lecture.ListIndex
++				if lectureNumber <= 0 {
++					lectureNumber = j + 1
+ 				}
+-
+-				fileName := fmt.Sprintf("第%d讲.mp4", j+1)
++				fileName := fmt.Sprintf("第%d讲.mp4", lectureNumber)
+ 				if ds.manager.isExtensive {
+-					lecture.LiveTypeString = "ONLINE_REAL_RECORD" // 强制设为延伸课程类型
+-					fileName = fmt.Sprintf("第%d讲_延伸内容.mp4", j+1)
++					fileName = fmt.Sprintf("第%d讲_延伸内容.mp4", lectureNumber)
+ 				}
+ 				filePath := filepath.Join(courseDir, fileName)
+ 
+ 				// 检查文件是否存在
+ 				if !utils.IsAndroid() {
+ 					if utils.IsFileExists(filePath) && !ds.manager.isOverwrite {
++						existingFileName := fileName
++						existingFilePath := filePath
+ 						fyne.Do(func() {
+-							ds.addProgressItem(course.CourseID, fileName, filePath, true, -1)
++							ds.addProgressItem(course.CourseID, existingFileName, existingFilePath, true, -1)
+ 						})
+ 						continue
+ 					}
+ 				}
+ 
+-				videoURL, err := ds.manager.apiClient.GetVideoURL(lecture, course.CourseID, course.TutorID)
++				var videoURL string
++				var err error
++				if ds.manager.isExtensive {
++					videoURL, err = ds.manager.apiClient.GetCourseExtensiveVideoURL(lecture, course)
++				} else {
++					videoURL, err = ds.manager.apiClient.GetCourseVideoURL(lecture, course)
++				}
+ 				if err != nil {
++					failedFileName := fileName
++					errorMessage := err.Error()
+ 					fyne.Do(func() {
+-						ds.addErrorItem(course.CourseID, fileName, err.Error())
++						ds.addErrorItem(course.CourseID, failedFileName, errorMessage)
+ 					})
+ 					continue
+ 				}
+ 
+-				task := dl.AddTask(videoURL, filePath, func(progress float64, speed string, currsize int64, totalSize int64) {
+-					ds.updateProgress(filePath, progress, speed, currsize, totalSize)
++				taskFileName := fileName
++				taskFilePath := filePath
++				task := dl.AddTask(videoURL, taskFilePath, func(progress float64, speed string, currsize int64, totalSize int64) {
++					ds.updateProgress(taskFilePath, progress, speed, currsize, totalSize)
+ 				})
+ 
+ 				// 线程安全地添加任务
+ 				ds.tasksMutex.Lock()
+ 				ds.downloadTasks = append(ds.downloadTasks, task)
+-				ds.taskMap[filePath] = task // 保存任务映射
++				ds.taskMap[taskFilePath] = task // 保存任务映射
+ 				ds.tasksMutex.Unlock()
+ 
+ 				fyne.Do(func() {
+-					ds.addProgressItem(course.CourseID, fileName, filePath, false, task.TotalSize)
++					ds.addProgressItem(course.CourseID, taskFileName, taskFilePath, false, task.TotalSize)
+ 				})
+ 			}
+-		}(course, courseDir, selectedLectureIndices)
++		}(course, courseDir, selectedLectures)
+ 
+ 	}
+ 
+@@ -535,6 +536,17 @@ func (ds *DownloadProgressScreen) toggleSingleTask(filePath string) {
+ 		ds.uiMapsMutex.RUnlock()
+ 
+ 		if hasBbtn {
++			if task.Status() == "error" {
++				btn.Disable()
++				if err := ds.manager.downloader.Retry(task); err != nil {
++					btn.Enable()
++					dialog.ShowError(err, ds.manager.window)
++					return
++				}
++				btn.SetText("暂停")
++				btn.Enable()
++				return
++			}
+ 			// 检查任务当前是否被暂停
+ 			if btn.Text == "暂停" {
+ 				task.Pause()
+diff --git a/ui/manager.go b/ui/manager.go
+index e22cc75..5a70ee4 100644
+--- a/ui/manager.go
++++ b/ui/manager.go
+@@ -21,7 +21,7 @@ type Manager struct {
+ 	apiClient            *api.Client
+ 	downloader           *downloader.Downloader
+ 	selectedCourses      []*models.Course
+-	selectedLectures     map[string][]int // courseID -> selected lecture indices
++	selectedLectures     map[string][]*models.Lecture
+ 	downloadPath         string
+ 	isExtensive          bool
+ 	isOverwrite          bool
+@@ -36,7 +36,7 @@ func NewManager(window fyne.Window, mainContainer *fyne.Container) *Manager {
+ 		mainContainer:        mainContainer,
+ 		apiClient:            api.NewClient(),
+ 		downloader:           downloader.NewDownloader(config.MaxConcurrentDownloads, config.ThreadCount),
+-		selectedLectures:     make(map[string][]int),
++		selectedLectures:     make(map[string][]*models.Lecture),
+ 		currentScreen:        "login",
+ 		isConfirmScreenShown: false,
+ 		isSaveUserInfo:       false,
+diff --git a/utils/os.go b/utils/os.go
+index 0e7d02c..33fb41b 100644
+--- a/utils/os.go
++++ b/utils/os.go
+@@ -68,6 +68,10 @@ func CreateFile(path string) (*os.File, error) {
+ 	return os.Create(actualPath)
+ }
+ 
++func RemoveFile(path string) error {
++	return os.Remove(GetAndroidSafeFilePath(path))
++}
++
+ func CopyToAndroidStorage(sourcePath string, writer fyne.URIWriteCloser) error {
+ 	actualPath := GetAndroidSafeFilePath(sourcePath)
+ 
+diff --git a/utils/url.go b/utils/url.go
+index 16c419e..6e968be 100644
+--- a/utils/url.go
++++ b/utils/url.go
+@@ -2,28 +2,95 @@ package utils
+ 
+ import (
+ 	"fmt"
++	"net/url"
++	"regexp"
++	"sort"
++	"strconv"
+ 	"strings"
+ )
+ 
+ func ParseVideoUrl(videoURLs []string, message string) (string, error) {
+-	var videoURL string
+-	for _, url := range videoURLs {
+-		if strings.Contains(strings.ToLower(url), ".mp4") {
+-			videoURL = url
+-			break
++	for _, rawURL := range videoURLs {
++		if isVideoURL(rawURL, ".mp4") {
++			return rawURL, nil
+ 		}
+ 	}
+ 
+-	if videoURL == "" {
+-		// fallback to m3u8 downloader
+-		for _, url := range videoURLs {
+-			if strings.Contains(strings.ToLower(url), ".m3u8") {
+-				videoURL = url
++	// Prefer the first playlist returned by the API. The old implementation
++	// retained the last match, which made the selected stream depend on response
++	// ordering even within a single quality definition.
++	for _, rawURL := range videoURLs {
++		if isVideoURL(rawURL, ".m3u8") {
++			return rawURL, nil
++		}
++	}
++
++	return "", fmt.Errorf("未找到回放：%s", message)
++}
++
++// ParseRecordVideoURL chooses a recording definition deterministically.
++// Go deliberately randomizes map iteration order, so callers must never range
++// over the definitions map and accept the first entry.
++func ParseRecordVideoURL(definitions map[string][]string, message string) (string, error) {
++	keys := make([]string, 0, len(definitions))
++	for key := range definitions {
++		keys = append(keys, key)
++	}
++	sort.Slice(keys, func(i, j int) bool {
++		left, right := qualityScore(keys[i]), qualityScore(keys[j])
++		if left != right {
++			return left > right
++		}
++		return strings.ToLower(keys[i]) > strings.ToLower(keys[j])
++	})
++
++	for _, key := range keys {
++		if videoURL, err := ParseVideoUrl(definitions[key], message); err == nil {
++			return videoURL, nil
++		}
++	}
++
++	return "", fmt.Errorf("未找到回放：%s", message)
++}
++
++func isVideoURL(rawURL, extension string) bool {
++	parsed, err := url.Parse(strings.TrimSpace(rawURL))
++	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
++		return false
++	}
++	return strings.Contains(strings.ToLower(parsed.Path), extension)
++}
++
++var qualityNumberPattern = regexp.MustCompile(`\d+`)
++
++func qualityScore(definition string) int {
++	value := strings.ToLower(strings.TrimSpace(definition))
++
++	qualityLabels := []struct {
++		labels []string
++		score  int
++	}{
++		{[]string{"origin", "original", "source", "uhd", "4k", "超清"}, 5000},
++		{[]string{"2k", "1440"}, 4000},
++		{[]string{"fhd", "1080", "fullhd", "蓝光"}, 3000},
++		{[]string{"hd", "720", "high", "高清"}, 2000},
++		{[]string{"sd", "480", "standard", "medium", "标清"}, 1000},
++		{[]string{"low", "360", "smooth", "流畅"}, 500},
++	}
++	for _, quality := range qualityLabels {
++		for _, label := range quality.labels {
++			if strings.Contains(value, label) {
++				return quality.score
+ 			}
+ 		}
+-		if videoURL == "" {
+-			return "", fmt.Errorf("未找到回放：%s", message)
++	}
++
++	highest := 0
++	for _, number := range qualityNumberPattern.FindAllString(value, -1) {
++		parsed, err := strconv.Atoi(number)
++		if err == nil && parsed > highest {
++			highest = parsed
+ 		}
+ 	}
+-	return videoURL, nil
++	return highest
+ }
+diff --git a/api/course_test.go b/api/course_test.go
+new file mode 100644
+index 0000000..d39b412
+--- /dev/null
++++ b/api/course_test.go
+@@ -0,0 +1,287 @@
++package api
++
++import (
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/itsHenry35/tal_downloader/config"
++	"github.com/itsHenry35/tal_downloader/models"
++)
++
++func TestGetCourseListGroupsClassTransferRecords(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if r.URL.Query().Get("page") == "1" {
++			fmt.Fprint(w, `[
++				{"stdCourseId":"new","tutorId":"teacher-a","courseName":"【科学思维】 初一暑期JS","subjectName":"科学思维","endLiveNum":15},
++				{"stdCourseId":"old-1","tutorId":"teacher-a","courseName":"【科学思维】 初一暑期JS","subjectName":"科学思维","endLiveNum":15},
++				{"stdCourseId":"old-2","tutorId":"teacher-b","courseName":"【科学思维】 初一暑期JS","subjectName":"科学思维","endLiveNum":15},
++				{"stdCourseId":"other","tutorId":"teacher-a","courseName":"【科学思维】 初一暑期JS","subjectName":"科学思维","endLiveNum":16}
++			]`)
++			return
++		}
++		fmt.Fprint(w, `[]`)
++	}))
++	defer server.Close()
++
++	oldBase := config.CourseAPIBase
++	config.CourseAPIBase = server.URL
++	defer func() { config.CourseAPIBase = oldBase }()
++
++	client := NewClient()
++	client.SetAuth("test-token", "student-1")
++	courses, err := client.GetCourseList()
++	if err != nil {
++		t.Fatalf("GetCourseList: %v", err)
++	}
++	if got, want := len(courses), 2; got != want {
++		t.Fatalf("course count = %d, want %d", got, want)
++	}
++	if got, want := courses[0].CourseID, "new"; got != want {
++		t.Fatalf("primary course ID = %q, want %q", got, want)
++	}
++	sources := courses[0].Sources()
++	if got, want := len(sources), 3; got != want {
++		t.Fatalf("source count = %d, want %d", got, want)
++	}
++	if got, want := sources[2].TutorID, "teacher-b"; got != want {
++		t.Fatalf("transferred tutor ID = %q, want %q", got, want)
++	}
++}
++
++func TestGetCourseLecturesKeepsTransferSourcesAsFallbacks(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if r.URL.Query().Get("page") != "1" {
++			fmt.Fprint(w, `[]`)
++			return
++		}
++		switch r.URL.Query().Get("stdCourseId") {
++		case "new":
++			fmt.Fprint(w, `[
++				{"liveId":101,"liveTypeString":"RECORD_MODE","liveName":"第一讲","tasks":[{"curriculumId":"c1","taskId":"t1","coursewareId":"w1"}]},
++				{"liveId":102,"liveTypeString":"RECORD_MODE","liveName":"第二讲","tasks":[{"curriculumId":"c2","taskId":"t2","coursewareId":"w2"}]}
++			]`)
++		case "old":
++			fmt.Fprint(w, `[
++				{"liveId":201,"liveTypeString":"RECORD_MODE","liveName":"第一讲","tasks":[{"curriculumId":"c1","taskId":"t1","coursewareId":"w1"}]},
++				{"liveId":202,"liveTypeString":"RECORD_MODE","liveName":"第二讲","tasks":[{"curriculumId":"c2","taskId":"t2","coursewareId":"w2"}]}
++			]`)
++		default:
++			fmt.Fprint(w, `[]`)
++		}
++	}))
++	defer server.Close()
++
++	oldBase := config.CourseAPIBase
++	config.CourseAPIBase = server.URL
++	defer func() { config.CourseAPIBase = oldBase }()
++
++	course := &models.Course{
++		CourseID: "new",
++		TutorID:  "teacher-new",
++		SourceCourses: []models.CourseSource{
++			{CourseID: "new", TutorID: "teacher-new"},
++			{CourseID: "old", TutorID: "teacher-old"},
++		},
++	}
++	client := NewClient()
++	client.SetAuth("test-token", "student-1")
++	lectures, err := client.GetCourseLectures(course)
++	if err != nil {
++		t.Fatalf("GetCourseLectures: %v", err)
++	}
++	if got, want := len(lectures), 2; got != want {
++		t.Fatalf("lecture count = %d, want %d", got, want)
++	}
++	if got, want := lectures[0].SourceCourseID, "new"; got != want {
++		t.Fatalf("primary source = %q, want %q", got, want)
++	}
++	if got, want := len(lectures[0].Alternates), 1; got != want {
++		t.Fatalf("alternate count = %d, want %d", got, want)
++	}
++	if got, want := lectures[0].Alternates[0].SourceCourseID, "old"; got != want {
++		t.Fatalf("alternate source = %q, want %q", got, want)
++	}
++}
++
++func TestGetCourseLecturesDoesNotMatchDifferentLessonsByPosition(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if r.URL.Query().Get("page") != "1" {
++			fmt.Fprint(w, `[]`)
++			return
++		}
++		if r.URL.Query().Get("stdCourseId") == "new" {
++			fmt.Fprint(w, `[{"liveId":801,"liveTypeString":"RECORD_MODE","liveName":"第八讲"}]`)
++			return
++		}
++		fmt.Fprint(w, `[{"liveId":101,"liveTypeString":"RECORD_MODE","liveName":"第一讲"}]`)
++	}))
++	defer server.Close()
++
++	oldBase := config.CourseAPIBase
++	config.CourseAPIBase = server.URL
++	defer func() { config.CourseAPIBase = oldBase }()
++
++	course := &models.Course{CourseID: "new", SourceCourses: []models.CourseSource{
++		{CourseID: "new"}, {CourseID: "old"},
++	}}
++	client := NewClient()
++	client.SetAuth("test-token", "student-1")
++	lectures, err := client.GetCourseLectures(course)
++	if err != nil {
++		t.Fatalf("GetCourseLectures: %v", err)
++	}
++	if got, want := len(lectures), 2; got != want {
++		t.Fatalf("lecture count = %d, want %d", got, want)
++	}
++	if got := len(lectures[0].Alternates); got != 0 {
++		t.Fatalf("different positional lesson became an alternate: %d", got)
++	}
++	if got, want := lectures[1].DisplayName, "第一讲"; got != want {
++		t.Fatalf("historical lesson = %q, want %q", got, want)
++	}
++}
++
++func TestGetCourseVideoURLFallsBackToHistoricalEnrollment(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if r.Header.Get("stdCourseId") == "new" {
++			http.Error(w, "not available for current enrollment", http.StatusForbidden)
++			return
++		}
++		if got, want := r.Header.Get("tutorId"), "teacher-old"; got != want {
++			t.Errorf("fallback tutor ID = %q, want %q", got, want)
++		}
++		fmt.Fprint(w, `{"definitions":{"高清":["https://media.example/old.mp4"]}}`)
++	}))
++	defer server.Close()
++
++	oldBase := config.ClassroomAPIBase
++	config.ClassroomAPIBase = server.URL
++	defer func() { config.ClassroomAPIBase = oldBase }()
++
++	primary := &models.Lecture{
++		LiveID: 101, LiveTypeString: "RECORD_MODE",
++		SourceCourseID: "new", SourceTutorID: "teacher-new",
++	}
++	primary.Alternates = []*models.Lecture{{
++		LiveID: 201, LiveTypeString: "RECORD_MODE",
++		SourceCourseID: "old", SourceTutorID: "teacher-old",
++	}}
++	course := &models.Course{CourseID: "new", TutorID: "teacher-new"}
++	client := NewClient()
++	client.SetAuth("test-token", "student-1")
++
++	got, err := client.GetCourseVideoURL(primary, course)
++	if err != nil {
++		t.Fatalf("GetCourseVideoURL: %v", err)
++	}
++	if want := "https://media.example/old.mp4"; got != want {
++		t.Fatalf("URL = %q, want %q", got, want)
++	}
++	if strings.Contains(got, "new") {
++		t.Fatalf("did not use fallback URL: %q", got)
++	}
++}
++
++func TestGetLecturesKeepsStableOrderAndDeduplicatesPages(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
++		w.Header().Set("Content-Type", "application/json")
++		switch page {
++		case 1:
++			fmt.Fprint(w, `[`)
++			for i := 1; i <= 10; i++ {
++				if i > 1 {
++					fmt.Fprint(w, `,`)
++				}
++				fmt.Fprintf(w, `{"liveId":%d,"liveTypeString":"RECORD_MODE","stdClassId":"c"}`, i)
++			}
++			fmt.Fprint(w, `]`)
++		case 2:
++			fmt.Fprint(w, `[
++				{"liveId":10,"liveTypeString":"RECORD_MODE","stdClassId":"c"},
++				{"liveId":11,"liveTypeString":"RECORD_MODE","stdClassId":"c","liveName":"期末复习"}
++			]`)
++		default:
++			fmt.Fprint(w, `[]`)
++		}
++	}))
++	defer server.Close()
++
++	oldBase := config.CourseAPIBase
++	config.CourseAPIBase = server.URL
++	defer func() { config.CourseAPIBase = oldBase }()
++
++	client := NewClient()
++	client.SetAuth("test-token", "student-1")
++	lectures, err := client.GetLectures("course-1")
++	if err != nil {
++		t.Fatalf("GetLectures: %v", err)
++	}
++	if got, want := len(lectures), 11; got != want {
++		t.Fatalf("lecture count = %d, want %d", got, want)
++	}
++	for i, lecture := range lectures {
++		if got, want := lecture.ListIndex, i+1; got != want {
++			t.Fatalf("lecture %d ListIndex = %d, want %d", i, got, want)
++		}
++	}
++	if got, want := lectures[10].Label(), "第11讲 - 期末复习"; got != want {
++		t.Fatalf("last label = %q, want %q", got, want)
++	}
++}
++
++func TestGetExtensiveVideoURLUsesResolvedRecordID(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		switch r.URL.Path {
++		case "/classroom/basic/v1/real-record/init/auth":
++			if got := r.URL.Query().Get("taskId"); got != "task-2" {
++				t.Errorf("taskId = %q", got)
++			}
++			fmt.Fprint(w, `{"initData":{"task":{"realRecordId":"record-999"}}}`)
++		case "/classroom-ai/record/v1/resources":
++			if got := r.Header.Get("liveId"); got != "record-999" {
++				t.Errorf("liveId header = %q, want resolved record ID", got)
++			}
++			if got := r.Header.Get("liveType"); got != "ONLINE_REAL_RECORD" {
++				t.Errorf("liveType header = %q", got)
++			}
++			fmt.Fprint(w, `{"definitions":{"高清":["https://media.example/extension.mp4"]}}`)
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	defer server.Close()
++
++	oldBase := config.ClassroomAPIBase
++	config.ClassroomAPIBase = server.URL
++	defer func() { config.ClassroomAPIBase = oldBase }()
++
++	client := NewClient()
++	client.SetAuth("test-token", "student-1")
++	lecture := &models.Lecture{
++		LiveID:     123,
++		LecturerID: "teacher-1",
++		Tasks: []models.LectureTask{{
++			CurriculumID: "curriculum-1",
++			TaskID:       "task-2",
++			CoursewareID: "courseware-3",
++		}},
++	}
++
++	got, err := client.GetExtensiveVideoURL(lecture)
++	if err != nil {
++		t.Fatalf("GetExtensiveVideoURL: %v", err)
++	}
++	if want := "https://media.example/extension.mp4"; got != want {
++		t.Fatalf("URL = %q, want %q", got, want)
++	}
++}
+diff --git a/downloader/downloader_test.go b/downloader/downloader_test.go
+new file mode 100644
+index 0000000..c7f0c75
+--- /dev/null
++++ b/downloader/downloader_test.go
+@@ -0,0 +1,263 @@
++package downloader
++
++import (
++	"bytes"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"testing"
++)
++
++func TestDownloadRegularFileWithVerifiedRanges(t *testing.T) {
++	content := bytes.Repeat([]byte("0123456789abcdef"), 64)
++	server := newRangeServer(t, content, false)
++	defer server.Close()
++
++	downloader := NewDownloader(1, 8)
++	downloader.client = server.Client()
++	filePath := filepath.Join(t.TempDir(), "lesson.mp4")
++	task := &DownloadTask{URL: server.URL, FilePath: filePath}
++
++	if err := downloader.downloadRegularFile(task); err != nil {
++		t.Fatalf("downloadRegularFile: %v", err)
++	}
++	assertFileContent(t, filePath, content)
++}
++
++func TestDownloadRegularFileFallsBackWhenRangeIsIgnored(t *testing.T) {
++	content := []byte("server returned the complete video")
++	server := newRangeServer(t, content, true)
++	defer server.Close()
++
++	downloader := NewDownloader(1, 8)
++	downloader.client = server.Client()
++	filePath := filepath.Join(t.TempDir(), "lesson.mp4")
++	task := &DownloadTask{URL: server.URL, FilePath: filePath}
++
++	if err := downloader.downloadRegularFile(task); err != nil {
++		t.Fatalf("downloadRegularFile: %v", err)
++	}
++	assertFileContent(t, filePath, content)
++}
++
++func TestDownloadRegularFileRejectsBrokenRangeAndRemovesPartialFile(t *testing.T) {
++	content := bytes.Repeat([]byte("video"), 128)
++	var requests atomic.Int64
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requestNumber := requests.Add(1)
++		if requestNumber == 1 {
++			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", len(content)))
++			w.WriteHeader(http.StatusPartialContent)
++			_, _ = w.Write(content[:1])
++			return
++		}
++		// A CDN that ignores later Range requests used to corrupt every chunk.
++		w.Header().Set("Content-Type", "video/mp4")
++		w.WriteHeader(http.StatusOK)
++		_, _ = w.Write(content)
++	}))
++	defer server.Close()
++
++	downloader := NewDownloader(1, 4)
++	downloader.client = server.Client()
++	filePath := filepath.Join(t.TempDir(), "lesson.mp4")
++	task := &DownloadTask{URL: server.URL, FilePath: filePath}
++
++	if err := downloader.downloadRegularFile(task); err == nil {
++		t.Fatal("expected a range validation error")
++	}
++	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
++		t.Fatalf("partial file should be removed, stat error = %v", err)
++	}
++}
++
++func TestStartConsumesPendingQueueOnlyOnce(t *testing.T) {
++	content := []byte("one queued download")
++	var requestCount atomic.Int64
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requestCount.Add(1)
++		w.Header().Set("Content-Type", "video/mp4")
++		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
++		_, _ = w.Write(content)
++	}))
++	defer server.Close()
++
++	downloader := NewDownloader(1, 2)
++	downloader.client = server.Client()
++	task := downloader.AddTask(server.URL, filepath.Join(t.TempDir(), "lesson.mp4"), nil)
++	downloader.Start()
++	task.Wait()
++	requestsAfterFirstStart := requestCount.Load()
++	if requestsAfterFirstStart != 2 {
++		t.Fatalf("first start made %d requests, want probe + download", requestsAfterFirstStart)
++	}
++
++	downloader.Start()
++	if got := requestCount.Load(); got != requestsAfterFirstStart {
++		t.Fatalf("old task ran again: requests = %d, want %d", got, requestsAfterFirstStart)
++	}
++}
++
++func TestRetryRestartsFailedTask(t *testing.T) {
++	content := []byte("retry completed video")
++	var fullRequests atomic.Int64
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "video/mp4")
++		if r.Header.Get("Range") != "" {
++			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
++			w.WriteHeader(http.StatusOK)
++			_, _ = w.Write(content)
++			return
++		}
++		if fullRequests.Add(1) == 1 {
++			http.Error(w, "temporary failure", http.StatusServiceUnavailable)
++			return
++		}
++		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
++		_, _ = w.Write(content)
++	}))
++	defer server.Close()
++
++	downloader := NewDownloader(1, 2)
++	downloader.client = server.Client()
++	filePath := filepath.Join(t.TempDir(), "lesson.mp4")
++	task := downloader.AddTask(server.URL, filePath, nil)
++	downloader.Start()
++	task.Wait()
++	if got, want := task.Status(), "error"; got != want {
++		t.Fatalf("first status = %q, want %q", got, want)
++	}
++	if err := downloader.Retry(task); err != nil {
++		t.Fatalf("Retry: %v", err)
++	}
++	task.Wait()
++	if got, want := task.Status(), "completed"; got != want {
++		t.Fatalf("retry status = %q, want %q", got, want)
++	}
++	assertFileContent(t, filePath, content)
++	if err := downloader.Retry(task); err == nil {
++		t.Fatal("completed task should not be retried")
++	}
++}
++
++func TestLoadHLSMediaPlaylistSelectsHighestVariantAndResolvesURLs(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/master.m3u8":
++			fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nlow/list.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=900\nhigh/list.m3u8\n")
++		case "/high/list.m3u8":
++			fmt.Fprint(w, "#EXTM3U\n#EXTINF:1,\n../segments/one.ts\n#EXTINF:1,\ntwo.ts?part=2\n")
++		case "/low/list.m3u8":
++			fmt.Fprint(w, "#EXTM3U\nlow.ts\n")
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	defer server.Close()
++
++	segments, err := loadHLSMediaPlaylist(server.Client(), server.URL+"/master.m3u8?token=abc", 0)
++	if err != nil {
++		t.Fatalf("loadHLSMediaPlaylist: %v", err)
++	}
++	want := []string{
++		server.URL + "/segments/one.ts?token=abc",
++		server.URL + "/high/two.ts?part=2&token=abc",
++	}
++	if len(segments) != len(want) {
++		t.Fatalf("segments = %#v, want %#v", segments, want)
++	}
++	for i := range want {
++		if segments[i] != want[i] {
++			t.Fatalf("segment %d = %q, want %q", i, segments[i], want[i])
++		}
++	}
++}
++
++func TestDownloadM3U8FailsWhenAnySegmentIsMissing(t *testing.T) {
++	var failedSegmentRequests atomic.Int64
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		switch r.URL.Path {
++		case "/lesson.m3u8":
++			fmt.Fprint(w, "#EXTM3U\n#EXTINF:1,\ngood.ts\n#EXTINF:1,\nmissing.ts\n")
++		case "/good.ts":
++			w.Header().Set("Content-Type", "video/mp2t")
++			_, _ = w.Write([]byte("good-segment"))
++		case "/missing.ts":
++			failedSegmentRequests.Add(1)
++			http.Error(w, "missing", http.StatusNotFound)
++		default:
++			http.NotFound(w, r)
++		}
++	}))
++	defer server.Close()
++
++	downloader := NewDownloader(1, 2)
++	downloader.client = server.Client()
++	filePath := filepath.Join(t.TempDir(), "lesson.mp4")
++	task := &DownloadTask{URL: server.URL + "/lesson.m3u8", FilePath: filePath}
++
++	if err := downloader.downloadM3U8(task); err == nil {
++		t.Fatal("expected a missing segment to fail the whole download")
++	}
++	if got, want := failedSegmentRequests.Load(), int64(3); got != want {
++		t.Fatalf("failed segment attempts = %d, want %d", got, want)
++	}
++	if _, err := os.Stat(filePath); !os.IsNotExist(err) {
++		t.Fatalf("incomplete HLS output should not exist, stat error = %v", err)
++	}
++}
++
++func TestParseContentRange(t *testing.T) {
++	start, end, total, err := parseContentRange("bytes 10-19/100")
++	if err != nil {
++		t.Fatalf("parseContentRange: %v", err)
++	}
++	if start != 10 || end != 19 || total != 100 {
++		t.Fatalf("got %d-%d/%d", start, end, total)
++	}
++	if _, _, _, err := parseContentRange("bytes */100"); err == nil {
++		t.Fatal("expected malformed range to fail")
++	}
++}
++
++func newRangeServer(t *testing.T, content []byte, ignoreRange bool) *httptest.Server {
++	t.Helper()
++	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "video/mp4")
++		rangeHeader := r.Header.Get("Range")
++		if ignoreRange || rangeHeader == "" {
++			w.Header().Set("Content-Length", strconv.Itoa(len(content)))
++			w.WriteHeader(http.StatusOK)
++			_, _ = w.Write(content)
++			return
++		}
++
++		var start, end int
++		if _, err := fmt.Sscanf(strings.TrimPrefix(rangeHeader, "bytes="), "%d-%d", &start, &end); err != nil {
++			t.Fatalf("invalid test range %q: %v", rangeHeader, err)
++		}
++		if end >= len(content) {
++			end = len(content) - 1
++		}
++		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(content)))
++		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
++		w.WriteHeader(http.StatusPartialContent)
++		_, _ = w.Write(content[start : end+1])
++	}))
++}
++
++func assertFileContent(t *testing.T, path string, want []byte) {
++	t.Helper()
++	got, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatalf("read %s: %v", path, err)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatalf("file content mismatch: got %d bytes, want %d", len(got), len(want))
++	}
++}
+diff --git a/models/global_test.go b/models/global_test.go
+new file mode 100644
+index 0000000..9b4b0d1
+--- /dev/null
++++ b/models/global_test.go
+@@ -0,0 +1,37 @@
++package models
++
++import (
++	"encoding/json"
++	"testing"
++)
++
++func TestLectureUnmarshalPreservesIDsAndDisplayName(t *testing.T) {
++	var lecture Lecture
++	payload := []byte(`{
++		"liveId": 42,
++		"liveTypeString": "RECORD_MODE",
++		"stdClassId": "class-1",
++		"stdSubject": "math",
++		"lecturerId": "teacher-1",
++		"lessonName": "函数专题",
++		"tasks": [{"curriculumId": 9007199254740993, "taskId": "task-2", "coursewareId": 3}]
++	}`)
++
++	if err := json.Unmarshal(payload, &lecture); err != nil {
++		t.Fatalf("unmarshal lecture: %v", err)
++	}
++	lecture.ListIndex = 7
++
++	if got, want := lecture.DisplayName, "函数专题"; got != want {
++		t.Fatalf("DisplayName = %q, want %q", got, want)
++	}
++	if got, want := lecture.Label(), "第7讲 - 函数专题"; got != want {
++		t.Fatalf("Label() = %q, want %q", got, want)
++	}
++	if got, want := lecture.Tasks[0].CurriculumID.String(), "9007199254740993"; got != want {
++		t.Fatalf("CurriculumID = %q, want %q", got, want)
++	}
++	if got, want := lecture.Tasks[0].TaskID.String(), "task-2"; got != want {
++		t.Fatalf("TaskID = %q, want %q", got, want)
++	}
++}
+diff --git a/utils/url_test.go b/utils/url_test.go
+new file mode 100644
+index 0000000..e7c3d46
+--- /dev/null
++++ b/utils/url_test.go
+@@ -0,0 +1,34 @@
++package utils
++
++import "testing"
++
++func TestParseRecordVideoURLUsesDeterministicHighestQuality(t *testing.T) {
++	definitions := map[string][]string{
++		"标清": {"https://media.example/lesson-sd.mp4?token=1"},
++		"高清": {"https://media.example/lesson-hd.m3u8?token=2"},
++		"1080P": {
++			"not-a-url",
++			"https://media.example/lesson-full.mp4?token=3",
++		},
++	}
++
++	for i := 0; i < 100; i++ {
++		got, err := ParseRecordVideoURL(definitions, "")
++		if err != nil {
++			t.Fatalf("ParseRecordVideoURL: %v", err)
++		}
++		if want := "https://media.example/lesson-full.mp4?token=3"; got != want {
++			t.Fatalf("iteration %d: got %q, want %q", i, got, want)
++		}
++	}
++}
++
++func TestParseVideoURLRejectsNonMediaResponse(t *testing.T) {
++	_, err := ParseVideoUrl([]string{
++		"https://media.example/error.json?file=.mp4",
++		"javascript:alert(1).m3u8",
++	}, "not ready")
++	if err == nil {
++		t.Fatal("expected an error for non-media URLs")
++	}
++}

@@ -119,3 +119,23 @@ func (c *Client) doRequest(method, urlStr string, body interface{}, headers map[
 
 	return resp, nil
 }
+
+func requireHTTPSuccess(resp *http.Response) error {
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+
+	var apiError struct {
+		Message string `json:"message"`
+		ErrMsg  string `json:"errmsg"`
+	}
+	_ = json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&apiError)
+	message := strings.TrimSpace(apiError.Message)
+	if message == "" {
+		message = strings.TrimSpace(apiError.ErrMsg)
+	}
+	if message != "" {
+		return fmt.Errorf("接口请求失败（HTTP %d）：%s", resp.StatusCode, message)
+	}
+	return fmt.Errorf("接口请求失败（HTTP %d）", resp.StatusCode)
+}
