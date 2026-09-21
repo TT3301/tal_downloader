@@ -59,6 +59,7 @@ func (course *Course) Sources() []CourseSource {
 type Lecture struct {
 	LiveID         int           `json:"liveId"`
 	LiveTypeString string        `json:"liveTypeString"`
+	Position       int           `json:"pos"`
 	ClassID        string        `json:"stdClassId"`
 	SubjectID      string        `json:"stdSubject"`
 	LecturerID     string        `json:"lecturerId"`
@@ -152,9 +153,26 @@ func (lecture *Lecture) StableKey() string {
 	if lecture == nil {
 		return ""
 	}
+	lessonNumber := lecture.LessonNumber()
 	return fmt.Sprintf("%d|%s|%s|%s|%d", lecture.LiveID, lecture.ClassID,
-		lecture.SubjectID, lecture.LiveTypeString, lecture.ListIndex)
+		lecture.SubjectID, lecture.LiveTypeString, lessonNumber)
 
+}
+
+// LessonNumber returns the server-defined course position whenever available.
+// ListIndex is only a compatibility fallback for older API responses that do
+// not include pos.
+func (lecture *Lecture) LessonNumber() int {
+	if lecture == nil {
+		return 0
+	}
+	if lecture.Position > 0 {
+		return lecture.Position
+	}
+	if lecture.ListIndex > 0 {
+		return lecture.ListIndex
+	}
+	return 0
 }
 
 func (lecture *Lecture) Label() string {
@@ -162,12 +180,18 @@ func (lecture *Lecture) Label() string {
 		return "未知课节"
 	}
 
-	index := lecture.ListIndex
-	if index <= 0 {
-		index = 1
+	lessonNumber := lecture.LessonNumber()
+	if lessonNumber <= 0 {
+		lessonNumber = 1
 	}
-	label := fmt.Sprintf("第%d讲", index)
-	if lecture.DisplayName != "" && lecture.DisplayName != label {
+	label := fmt.Sprintf("第%d讲", lessonNumber)
+	if lecture.DisplayName != "" {
+		if lecture.DisplayName == label {
+			return label
+		}
+		if strings.HasPrefix(lecture.DisplayName, label) {
+			return lecture.DisplayName
+		}
 		label += " - " + lecture.DisplayName
 	}
 	return label

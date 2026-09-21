@@ -319,7 +319,7 @@ func (ds *DownloadProgressScreen) startDownloads() {
 					continue
 				}
 
-				lectureNumber := lecture.ListIndex
+				lectureNumber := lecture.LessonNumber()
 				if lectureNumber <= 0 {
 					lectureNumber = j + 1
 				}
