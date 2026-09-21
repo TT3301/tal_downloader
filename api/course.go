@@ -23,19 +23,39 @@ func (c *Client) GetCourseList() ([]*models.Course, error) {
 
 		resp, err := c.doRequest("GET", coursesURL, nil, nil, false)
 		if err != nil {
+			utils.LogDiagnostic("course_list_error", map[string]interface{}{
+				"phase": "request",
+				"page":  page,
+				"error": err.Error(),
+			})
 			return nil, err
 		}
 		if err := requireHTTPSuccess(resp); err != nil {
 			resp.Body.Close()
+			utils.LogDiagnostic("course_list_error", map[string]interface{}{
+				"phase": "http_status",
+				"page":  page,
+				"error": err.Error(),
+			})
 			return nil, err
 		}
 
 		var courses []*models.Course
 		if err := json.NewDecoder(resp.Body).Decode(&courses); err != nil {
 			resp.Body.Close()
+			utils.LogDiagnostic("course_list_error", map[string]interface{}{
+				"phase": "decode",
+				"page":  page,
+				"error": err.Error(),
+			})
 			return nil, err
 		}
 		resp.Body.Close()
+		utils.LogDiagnostic("course_list_page", map[string]interface{}{
+			"page":    page,
+			"count":   len(courses),
+			"courses": summarizeCourses(courses),
+		})
 
 		if len(courses) == 0 {
 			break // no more data
@@ -45,7 +65,39 @@ func (c *Client) GetCourseList() ([]*models.Course, error) {
 		page++
 	}
 
-	return mergeDuplicateCourses(allCourses), nil
+	merged := mergeDuplicateCourses(allCourses)
+	utils.LogDiagnostic("course_list_merged", map[string]interface{}{
+		"raw_count":     len(allCourses),
+		"display_count": len(merged),
+		"courses":       summarizeCourses(merged),
+	})
+	return merged, nil
+}
+
+func summarizeCourses(courses []*models.Course) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0, len(courses))
+	for _, course := range courses {
+		if course == nil {
+			continue
+		}
+		sources := make([]map[string]string, 0, len(course.Sources()))
+		for _, source := range course.Sources() {
+			sources = append(sources, map[string]string{
+				"course_id": source.CourseID,
+				"tutor_id":  source.TutorID,
+			})
+		}
+		result = append(result, map[string]interface{}{
+			"course_id":    course.CourseID,
+			"tutor_id":     course.TutorID,
+			"subject_name": course.SubjectName,
+			"course_name":  course.CourseName,
+			"end_live_num": course.EndLiveNum,
+			"source_count": len(sources),
+			"sources":      sources,
+		})
+	}
+	return result
 }
 
 func mergeDuplicateCourses(courses []*models.Course) []*models.Course {

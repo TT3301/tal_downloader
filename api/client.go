@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/itsHenry35/tal_downloader/config"
-	"github.com/itsHenry35/tal_downloader/constants"
+	"github.com/itsHenry35/tal_downloader/utils"
 )
 
 type Client struct {
@@ -94,28 +94,32 @@ func (c *Client) doRequest(method, urlStr string, body interface{}, headers map[
 		req.Header.Set("stuId", c.userID)
 	}
 
+	startedAt := time.Now()
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		utils.LogDiagnostic("http_request_error", map[string]interface{}{
+			"method":      method,
+			"url":         utils.SanitizeDiagnosticURL(urlStr),
+			"duration_ms": time.Since(startedAt).Milliseconds(),
+			"error":       err.Error(),
+		})
 		return nil, err
 	}
 
-	if constants.Version == "Debug" {
-		fmt.Println("Request URL:", urlStr)
-		fmt.Println("Request Method:", method)
-		// print request headers
-		fmt.Println("Request Headers:", req.Header)
-	}
-	// print response body
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		utils.LogDiagnostic("http_response_read_error", map[string]interface{}{
+			"method":      method,
+			"url":         utils.SanitizeDiagnosticURL(urlStr),
+			"status":      resp.StatusCode,
+			"duration_ms": time.Since(startedAt).Milliseconds(),
+			"error":       err.Error(),
+		})
 		return nil, err
 	}
 	// Reset the response body so it can be read again later
 	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-	if constants.Version == "Debug" {
-		fmt.Println("Response Status:", resp.Status)
-		fmt.Println("Response Body:", string(bodyBytes))
-	}
+	utils.LogHTTPResponse(method, urlStr, resp.StatusCode, time.Since(startedAt), bodyBytes)
 
 	return resp, nil
 }
