@@ -2,7 +2,7 @@ package constants
 
 const Version = "Debug"
 const BuildTime = "Unknown"
-const Author = "Henry"
+const Author = "TT3301"
 
-const GithubURL = "https://github.com/itsHenry35/tal_downloader"
-const FeedbackURL = "https://github.com/itsHenry35/tal_downloader/issues"
+const GithubURL = "https://github.com/TT3301/tal_downloader"
+const FeedbackURL = "https://github.com/TT3301/tal_downloader/issues"
