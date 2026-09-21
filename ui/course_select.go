@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/itsHenry35/tal_downloader/config"
 	"github.com/itsHenry35/tal_downloader/models"
@@ -139,6 +140,7 @@ func (cs *CourseSelectionScreen) buildUI() {
 
 	downloadButton := widget.NewButton("开始下载", cs.startDownload)
 	downloadButton.Importance = widget.HighImportance
+	exportLogButton := widget.NewButton("导出日志", cs.exportDiagnosticLog)
 
 	// 顶部部分（标题）
 	// 使用Stack布局实现绝对定位，确保标题真正居中
@@ -173,6 +175,7 @@ func (cs *CourseSelectionScreen) buildUI() {
 				selectAllButton,
 				deselectAllButton,
 				layout.NewSpacer(),
+				exportLogButton,
 				downloadButton,
 			),
 		),
@@ -186,6 +189,32 @@ func (cs *CourseSelectionScreen) buildUI() {
 
 	// 包一层 padding，让边缘不贴边
 	cs.container = container.NewPadded(content)
+}
+
+func (cs *CourseSelectionScreen) exportDiagnosticLog() {
+	saveDialog := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil {
+			utils.ShowErrorDialog(err, cs.manager.window)
+			return
+		}
+		if writer == nil {
+			return
+		}
+
+		exportErr := utils.ExportDiagnosticLog(writer)
+		closeErr := writer.Close()
+		if exportErr != nil {
+			utils.ShowErrorDialog(exportErr, cs.manager.window)
+			return
+		}
+		if closeErr != nil {
+			utils.ShowErrorDialog(fmt.Errorf("关闭导出文件失败: %w", closeErr), cs.manager.window)
+			return
+		}
+		dialog.ShowInformation("导出成功", "诊断日志已导出。", cs.manager.window)
+	}, cs.manager.window)
+	saveDialog.SetFileName("tal_downloader_diagnostics_" + time.Now().Format("20060102-150405") + ".jsonl")
+	saveDialog.Show()
 }
 
 func (cs *CourseSelectionScreen) updateCourseList() {

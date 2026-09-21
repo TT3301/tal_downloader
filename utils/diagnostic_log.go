@@ -5,9 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +24,8 @@ const (
 )
 
 var diagnosticLogMu sync.Mutex
+
+var diagnosticSecretPattern = regexp.MustCompile(`(?i)(token|password|passwd|cookie|authorization|secret|auth_key|sign_token|sms_code|verify_code|phone|mobile|email|account|username)\s*[:=]\s*["']?([^\s,;&"']+)`)
 
 // DiagnosticLogPath returns the local-only diagnostic log path.
 // It prefers Fyne's application storage directory and has a safe fallback for
@@ -72,6 +77,32 @@ func LogDiagnostic(event string, fields map[string]interface{}) {
 
 	data = append(data, '\n')
 	_, _ = file.Write(data)
+}
+
+// ExportDiagnosticLog writes a consistent snapshot of the diagnostic log.
+// The same mutex is shared with LogDiagnostic, so an exported JSONL file can
+// never end with a partially written event.
+func ExportDiagnosticLog(writer io.Writer) error {
+	if writer == nil {
+		return fmt.Errorf("导出目标不可用")
+	}
+
+	diagnosticLogMu.Lock()
+	defer diagnosticLogMu.Unlock()
+
+	file, err := os.Open(DiagnosticLogPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("暂无诊断日志，请先登录并执行一次操作")
+		}
+		return fmt.Errorf("打开诊断日志失败: %w", err)
+	}
+	defer file.Close()
+
+	if _, err := io.Copy(writer, file); err != nil {
+		return fmt.Errorf("写入导出文件失败: %w", err)
+	}
+	return nil
 }
 
 // LogHTTPResponse records API response metadata and a bounded, sanitized body.
@@ -166,7 +197,7 @@ func sanitizeDiagnosticText(value string) string {
 	if err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
 		return SanitizeDiagnosticURL(value)
 	}
-	return value
+	return diagnosticSecretPattern.ReplaceAllString(value, "$1=[REDACTED]")
 }
 
 func sensitiveDiagnosticField(key string) bool {
@@ -179,8 +210,15 @@ func sensitiveDiagnosticField(key string) bool {
 		strings.Contains(lower, "secret") ||
 		strings.Contains(lower, "signature") ||
 		strings.Contains(lower, "sign_token") ||
+		strings.Contains(lower, "auth_key") ||
 		strings.Contains(lower, "verify_code") ||
+		strings.Contains(lower, "sms_code") ||
+		strings.Contains(lower, "phone") ||
+		strings.Contains(lower, "mobile") ||
+		strings.Contains(lower, "email") ||
 		lower == "code" ||
+		lower == "account" ||
+		lower == "username" ||
 		lower == "stuid" ||
 		lower == "user_id" ||
 		lower == "userid" ||
