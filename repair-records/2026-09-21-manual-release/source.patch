@@ -1,0 +1,112 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index fc38606..dd7f8de 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -4,6 +4,9 @@ on:
+   release:
+     types: [published]
+ 
++permissions:
++  contents: write
++
+ jobs:
+   Build_Linux:
+     runs-on: ubuntu-22.04
+@@ -343,4 +346,4 @@ jobs:
+         uses: actions/upload-artifact@v4
+         with:
+           name: "MacOS-x86_64-build"
+-          path: tal_downloader_macos_x86_64_${{ github.event.release.tag_name }}.zip
+\ No newline at end of file
++          path: tal_downloader_macos_x86_64_${{ github.event.release.tag_name }}.zip
+diff --git a/.github/workflows/manual-release.yml b/.github/workflows/manual-release.yml
+new file mode 100644
+index 0000000..78ff845
+--- /dev/null
++++ b/.github/workflows/manual-release.yml
+@@ -0,0 +1,85 @@
++name: Publish Release
++
++on:
++  workflow_dispatch:
++    inputs:
++      version:
++        description: '版本标签，例如 v3.2.3'
++        required: true
++        type: string
++      prerelease:
++        description: '标记为预发布版本'
++        required: true
++        default: false
++        type: boolean
++
++permissions:
++  contents: write
++
++concurrency:
++  group: publish-release
++  cancel-in-progress: false
++
++jobs:
++  publish:
++    name: Create release from main
++    runs-on: ubuntu-latest
++    steps:
++      - name: Checkout main
++        uses: actions/checkout@v5
++        with:
++          ref: main
++          fetch-depth: 0
++
++      - name: Validate version and tag
++        id: release
++        shell: bash
++        env:
++          INPUT_VERSION: ${{ inputs.version }}
++        run: |
++          set -euo pipefail
++
++          TAG=$(printf '%s' "$INPUT_VERSION" | xargs)
++          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
++            echo "版本格式错误：请使用 v3.2.3 这样的格式。" >&2
++            exit 1
++          fi
++
++          if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null || \
++             git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
++            echo "标签 $TAG 已存在，请换用新的版本号。" >&2
++            exit 1
++          fi
++
++          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
++          echo "target_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
++
++      - name: Create GitHub Release
++        shell: bash
++        env:
++          GH_TOKEN: ${{ github.token }}
++          TAG: ${{ steps.release.outputs.tag }}
++          TARGET_SHA: ${{ steps.release.outputs.target_sha }}
++          PRERELEASE: ${{ inputs.prerelease }}
++        run: |
++          set -euo pipefail
++
++          args=(
++            "$TAG"
++            --repo "$GITHUB_REPOSITORY"
++            --target "$TARGET_SHA"
++            --title "$TAG"
++            --generate-notes
++          )
++          if [[ "$PRERELEASE" == "true" ]]; then
++            args+=(--prerelease)
++          fi
++
++          gh release create "${args[@]}"
++
++      - name: Explain next step
++        env:
++          TAG: ${{ steps.release.outputs.tag }}
++        run: |
++          echo "Release $TAG 已创建。"
++          echo "现有 Build 工作流将由 release.published 事件自动触发并上传 Windows 客户端。"
