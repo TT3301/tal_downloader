@@ -1,0 +1,415 @@
+diff --git a/api/client.go b/api/client.go
+index 607576b..d4ae046 100644
+--- a/api/client.go
++++ b/api/client.go
+@@ -11,7 +11,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/itsHenry35/tal_downloader/config"
+-	"github.com/itsHenry35/tal_downloader/constants"
++	"github.com/itsHenry35/tal_downloader/utils"
+ )
+ 
+ type Client struct {
+@@ -94,28 +94,32 @@ func (c *Client) doRequest(method, urlStr string, body interface{}, headers map[
+ 		req.Header.Set("stuId", c.userID)
+ 	}
+ 
++	startedAt := time.Now()
+ 	resp, err := c.httpClient.Do(req)
+ 	if err != nil {
++		utils.LogDiagnostic("http_request_error", map[string]interface{}{
++			"method":      method,
++			"url":         utils.SanitizeDiagnosticURL(urlStr),
++			"duration_ms": time.Since(startedAt).Milliseconds(),
++			"error":       err.Error(),
++		})
+ 		return nil, err
+ 	}
+ 
+-	if constants.Version == "Debug" {
+-		fmt.Println("Request URL:", urlStr)
+-		fmt.Println("Request Method:", method)
+-		// print request headers
+-		fmt.Println("Request Headers:", req.Header)
+-	}
+-	// print response body
+ 	bodyBytes, err := io.ReadAll(resp.Body)
+ 	if err != nil {
++		utils.LogDiagnostic("http_response_read_error", map[string]interface{}{
++			"method":      method,
++			"url":         utils.SanitizeDiagnosticURL(urlStr),
++			"status":      resp.StatusCode,
++			"duration_ms": time.Since(startedAt).Milliseconds(),
++			"error":       err.Error(),
++		})
+ 		return nil, err
+ 	}
+ 	// Reset the response body so it can be read again later
+ 	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+-	if constants.Version == "Debug" {
+-		fmt.Println("Response Status:", resp.Status)
+-		fmt.Println("Response Body:", string(bodyBytes))
+-	}
++	utils.LogHTTPResponse(method, urlStr, resp.StatusCode, time.Since(startedAt), bodyBytes)
+ 
+ 	return resp, nil
+ }
+diff --git a/api/course.go b/api/course.go
+index d4130af..7ebdea4 100644
+--- a/api/course.go
++++ b/api/course.go
+@@ -23,19 +23,39 @@ func (c *Client) GetCourseList() ([]*models.Course, error) {
+ 
+ 		resp, err := c.doRequest("GET", coursesURL, nil, nil, false)
+ 		if err != nil {
++			utils.LogDiagnostic("course_list_error", map[string]interface{}{
++				"phase": "request",
++				"page":  page,
++				"error": err.Error(),
++			})
+ 			return nil, err
+ 		}
+ 		if err := requireHTTPSuccess(resp); err != nil {
+ 			resp.Body.Close()
++			utils.LogDiagnostic("course_list_error", map[string]interface{}{
++				"phase": "http_status",
++				"page":  page,
++				"error": err.Error(),
++			})
+ 			return nil, err
+ 		}
+ 
+ 		var courses []*models.Course
+ 		if err := json.NewDecoder(resp.Body).Decode(&courses); err != nil {
+ 			resp.Body.Close()
++			utils.LogDiagnostic("course_list_error", map[string]interface{}{
++				"phase": "decode",
++				"page":  page,
++				"error": err.Error(),
++			})
+ 			return nil, err
+ 		}
+ 		resp.Body.Close()
++		utils.LogDiagnostic("course_list_page", map[string]interface{}{
++			"page":    page,
++			"count":   len(courses),
++			"courses": summarizeCourses(courses),
++		})
+ 
+ 		if len(courses) == 0 {
+ 			break // no more data
+@@ -45,7 +65,39 @@ func (c *Client) GetCourseList() ([]*models.Course, error) {
+ 		page++
+ 	}
+ 
+-	return mergeDuplicateCourses(allCourses), nil
++	merged := mergeDuplicateCourses(allCourses)
++	utils.LogDiagnostic("course_list_merged", map[string]interface{}{
++		"raw_count":     len(allCourses),
++		"display_count": len(merged),
++		"courses":       summarizeCourses(merged),
++	})
++	return merged, nil
++}
++
++func summarizeCourses(courses []*models.Course) []map[string]interface{} {
++	result := make([]map[string]interface{}, 0, len(courses))
++	for _, course := range courses {
++		if course == nil {
++			continue
++		}
++		sources := make([]map[string]string, 0, len(course.Sources()))
++		for _, source := range course.Sources() {
++			sources = append(sources, map[string]string{
++				"course_id": source.CourseID,
++				"tutor_id":  source.TutorID,
++			})
++		}
++		result = append(result, map[string]interface{}{
++			"course_id":    course.CourseID,
++			"tutor_id":     course.TutorID,
++			"subject_name": course.SubjectName,
++			"course_name":  course.CourseName,
++			"end_live_num": course.EndLiveNum,
++			"source_count": len(sources),
++			"sources":      sources,
++		})
++	}
++	return result
+ }
+ 
+ func mergeDuplicateCourses(courses []*models.Course) []*models.Course {
+diff --git a/main.go b/main.go
+index afe307e..83565e0 100644
+--- a/main.go
++++ b/main.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"github.com/itsHenry35/tal_downloader/config"
++	"github.com/itsHenry35/tal_downloader/constants"
+ 	"github.com/itsHenry35/tal_downloader/ui"
+ 	"github.com/itsHenry35/tal_downloader/utils"
+ 
+@@ -11,6 +12,10 @@ import (
+ 
+ func main() {
+ 	myApp := app.NewWithID("com.itshenry.tal_downloader")
++	utils.LogDiagnostic("app_start", map[string]interface{}{
++		"version":  constants.Version,
++		"log_path": utils.DiagnosticLogPath(),
++	})
+ 
+ 	// 安卓平台启动时清理临时文件夹
+ 	if utils.IsAndroid() {
+diff --git a/utils/diagnostic_log.go b/utils/diagnostic_log.go
+new file mode 100644
+index 0000000..c536adc
+--- /dev/null
++++ b/utils/diagnostic_log.go
+@@ -0,0 +1,195 @@
++package utils
++
++import (
++	"bytes"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++	"time"
++
++	"fyne.io/fyne/v2"
++)
++
++const (
++	DiagnosticLogFileName = "diagnostics.jsonl"
++	maxDiagnosticBodySize = 256 * 1024
++)
++
++var diagnosticLogMu sync.Mutex
++
++// DiagnosticLogPath returns the local-only diagnostic log path.
++// It prefers Fyne's application storage directory and has a safe fallback for
++// tests or calls made before the Fyne application is initialized.
++func DiagnosticLogPath() string {
++	if currentApp := fyne.CurrentApp(); currentApp != nil {
++		if storage := currentApp.Storage(); storage != nil {
++			if rootURI := storage.RootURI(); rootURI != nil && rootURI.Path() != "" {
++				return filepath.Join(rootURI.Path(), DiagnosticLogFileName)
++			}
++		}
++	}
++
++	if configDir, err := os.UserConfigDir(); err == nil && configDir != "" {
++		return filepath.Join(configDir, "tal_downloader", DiagnosticLogFileName)
++	}
++	return filepath.Join(os.TempDir(), "tal_downloader", DiagnosticLogFileName)
++}
++
++// LogDiagnostic appends one JSON object per line. Logging failures are
++// intentionally ignored so diagnostics can never break downloading.
++func LogDiagnostic(event string, fields map[string]interface{}) {
++	entry := map[string]interface{}{
++		"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
++		"event":     event,
++	}
++	for key, value := range fields {
++		entry[key] = value
++	}
++
++	data, err := json.Marshal(entry)
++	if err != nil {
++		return
++	}
++
++	path := DiagnosticLogPath()
++	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++		return
++	}
++
++	diagnosticLogMu.Lock()
++	defer diagnosticLogMu.Unlock()
++
++	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
++	if err != nil {
++		return
++	}
++	defer file.Close()
++
++	data = append(data, '\n')
++	_, _ = file.Write(data)
++}
++
++// LogHTTPResponse records API response metadata and a bounded, sanitized body.
++// Request headers are deliberately not accepted here, preventing credentials
++// from entering the diagnostic log by accident.
++func LogHTTPResponse(method, rawURL string, statusCode int, duration time.Duration, body []byte) {
++	LogDiagnostic("http_response", map[string]interface{}{
++		"method":          method,
++		"url":             SanitizeDiagnosticURL(rawURL),
++		"status":          statusCode,
++		"duration_ms":     duration.Milliseconds(),
++		"response_bytes":  len(body),
++		"response_sha256": HashDiagnosticBytes(body),
++		"response_body":   SanitizeDiagnosticBody(body),
++	})
++}
++
++func HashDiagnosticBytes(data []byte) string {
++	digest := sha256.Sum256(data)
++	return hex.EncodeToString(digest[:])
++}
++
++// SanitizeDiagnosticURL keeps the path and non-sensitive query keys while
++// replacing identifiers and signed URL parameters with a fixed marker.
++func SanitizeDiagnosticURL(rawURL string) string {
++	parsed, err := url.Parse(rawURL)
++	if err != nil {
++		return "[invalid-url]"
++	}
++
++	query := parsed.Query()
++	for key := range query {
++		if sensitiveDiagnosticField(key) || sensitiveURLQueryField(key) {
++			query.Set(key, "[REDACTED]")
++		}
++	}
++	parsed.RawQuery = query.Encode()
++	return parsed.String()
++}
++
++// SanitizeDiagnosticBody preserves JSON structure and useful course metadata,
++// while redacting credentials and signed media URL parameters. Large bodies
++// are represented by size and hash instead of being written in full.
++func SanitizeDiagnosticBody(body []byte) interface{} {
++	trimmed := bytes.TrimSpace(body)
++	if len(trimmed) > maxDiagnosticBodySize {
++		return map[string]interface{}{
++			"truncated": true,
++			"bytes":     len(trimmed),
++			"sha256":    HashDiagnosticBytes(trimmed),
++		}
++	}
++
++	var value interface{}
++	if err := json.Unmarshal(trimmed, &value); err == nil {
++		return sanitizeDiagnosticValue(value)
++	}
++
++	return map[string]interface{}{
++		"format": "non-json",
++		"text":   sanitizeDiagnosticText(string(trimmed)),
++	}
++}
++
++func sanitizeDiagnosticValue(value interface{}) interface{} {
++	switch typed := value.(type) {
++	case map[string]interface{}:
++		result := make(map[string]interface{}, len(typed))
++		for key, item := range typed {
++			if sensitiveDiagnosticField(key) {
++				result[key] = "[REDACTED]"
++				continue
++			}
++			result[key] = sanitizeDiagnosticValue(item)
++		}
++		return result
++	case []interface{}:
++		result := make([]interface{}, len(typed))
++		for index, item := range typed {
++			result[index] = sanitizeDiagnosticValue(item)
++		}
++		return result
++	case string:
++		return sanitizeDiagnosticText(typed)
++	default:
++		return value
++	}
++}
++
++func sanitizeDiagnosticText(value string) string {
++	parsed, err := url.Parse(value)
++	if err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
++		return SanitizeDiagnosticURL(value)
++	}
++	return value
++}
++
++func sensitiveDiagnosticField(key string) bool {
++	lower := strings.ToLower(strings.TrimSpace(key))
++	return strings.Contains(lower, "token") ||
++		strings.Contains(lower, "password") ||
++		strings.Contains(lower, "passwd") ||
++		strings.Contains(lower, "cookie") ||
++		strings.Contains(lower, "authorization") ||
++		strings.Contains(lower, "secret") ||
++		strings.Contains(lower, "signature") ||
++		strings.Contains(lower, "sign_token") ||
++		strings.Contains(lower, "verify_code") ||
++		lower == "code" ||
++		lower == "stuid" ||
++		lower == "user_id" ||
++		lower == "userid" ||
++		lower == "pu_uid"
++}
++
++func sensitiveURLQueryField(key string) bool {
++	lower := strings.ToLower(strings.TrimSpace(key))
++	return lower == "auth_key" || lower == "expires" || lower == "expire" ||
++		lower == "timestamp" || lower == "sign" || lower == "sig" ||
++		lower == "key"
++}
+diff --git a/utils/diagnostic_log_test.go b/utils/diagnostic_log_test.go
+new file mode 100644
+index 0000000..bc45269
+--- /dev/null
++++ b/utils/diagnostic_log_test.go
+@@ -0,0 +1,43 @@
++package utils
++
++import (
++	"encoding/json"
++	"strings"
++	"testing"
++)
++
++func TestSanitizeDiagnosticURL(t *testing.T) {
++	input := "https://example.test/course?stuId=student-1&page=1&token=secret&foo=bar"
++	got := SanitizeDiagnosticURL(input)
++
++	if strings.Contains(got, "student-1") || strings.Contains(got, "secret") {
++		t.Fatalf("sensitive URL value leaked: %s", got)
++	}
++	if !strings.Contains(got, "page=1") || !strings.Contains(got, "foo=bar") {
++		t.Fatalf("non-sensitive URL values were not preserved: %s", got)
++	}
++}
++
++func TestSanitizeDiagnosticBodyPreservesCourseDataAndRedactsSecrets(t *testing.T) {
++	input := []byte(`{
++		"stdCourseId":"course-1",
++		"courseName":"【科学思维】初一暑期JS",
++		"token":"secret-token",
++		"videoUrls":["https://media.example/video.m3u8?auth_key=secret-key&quality=hd"]
++	}`)
++
++	sanitized, err := json.Marshal(SanitizeDiagnosticBody(input))
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := string(sanitized)
++	if !strings.Contains(got, "course-1") || !strings.Contains(got, "初一暑期JS") {
++		t.Fatalf("course data was lost: %s", got)
++	}
++	if strings.Contains(got, "secret-token") || strings.Contains(got, "secret-key") {
++		t.Fatalf("secret leaked: %s", got)
++	}
++	if !strings.Contains(got, "quality=hd") || !strings.Contains(got, "REDACTED") {
++		t.Fatalf("signed URL was not sanitized as expected: %s", got)
++	}
++}

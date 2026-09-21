@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/itsHenry35/tal_downloader/config"
+	"github.com/itsHenry35/tal_downloader/constants"
 	"github.com/itsHenry35/tal_downloader/ui"
 	"github.com/itsHenry35/tal_downloader/utils"
 
@@ -11,6 +12,10 @@ import (
 
 func main() {
 	myApp := app.NewWithID("com.itshenry.tal_downloader")
+	utils.LogDiagnostic("app_start", map[string]interface{}{
+		"version":  constants.Version,
+		"log_path": utils.DiagnosticLogPath(),
+	})
 
 	// 安卓平台启动时清理临时文件夹
 	if utils.IsAndroid() {

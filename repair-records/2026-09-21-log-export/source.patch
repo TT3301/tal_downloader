@@ -1,0 +1,227 @@
+diff --git a/ui/course_select.go b/ui/course_select.go
+index a1e0459..a4d3af1 100644
+--- a/ui/course_select.go
++++ b/ui/course_select.go
+@@ -4,6 +4,7 @@ import (
+ 	"fmt"
+ 	"path/filepath"
+ 	"sync"
++	"time"
+ 
+ 	"github.com/itsHenry35/tal_downloader/config"
+ 	"github.com/itsHenry35/tal_downloader/models"
+@@ -139,6 +140,7 @@ func (cs *CourseSelectionScreen) buildUI() {
+ 
+ 	downloadButton := widget.NewButton("开始下载", cs.startDownload)
+ 	downloadButton.Importance = widget.HighImportance
++	exportLogButton := widget.NewButton("导出日志", cs.exportDiagnosticLog)
+ 
+ 	// 顶部部分（标题）
+ 	// 使用Stack布局实现绝对定位，确保标题真正居中
+@@ -173,6 +175,7 @@ func (cs *CourseSelectionScreen) buildUI() {
+ 				selectAllButton,
+ 				deselectAllButton,
+ 				layout.NewSpacer(),
++				exportLogButton,
+ 				downloadButton,
+ 			),
+ 		),
+@@ -188,6 +191,32 @@ func (cs *CourseSelectionScreen) buildUI() {
+ 	cs.container = container.NewPadded(content)
+ }
+ 
++func (cs *CourseSelectionScreen) exportDiagnosticLog() {
++	saveDialog := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
++		if err != nil {
++			utils.ShowErrorDialog(err, cs.manager.window)
++			return
++		}
++		if writer == nil {
++			return
++		}
++
++		exportErr := utils.ExportDiagnosticLog(writer)
++		closeErr := writer.Close()
++		if exportErr != nil {
++			utils.ShowErrorDialog(exportErr, cs.manager.window)
++			return
++		}
++		if closeErr != nil {
++			utils.ShowErrorDialog(fmt.Errorf("关闭导出文件失败: %w", closeErr), cs.manager.window)
++			return
++		}
++		dialog.ShowInformation("导出成功", "诊断日志已导出。", cs.manager.window)
++	}, cs.manager.window)
++	saveDialog.SetFileName("tal_downloader_diagnostics_" + time.Now().Format("20060102-150405") + ".jsonl")
++	saveDialog.Show()
++}
++
+ func (cs *CourseSelectionScreen) updateCourseList() {
+ 	cs.courseList.Objects = nil
+ 	// 添加课程复选框
+diff --git a/utils/diagnostic_log.go b/utils/diagnostic_log.go
+index c536adc..0df76ff 100644
+--- a/utils/diagnostic_log.go
++++ b/utils/diagnostic_log.go
+@@ -5,9 +5,12 @@ import (
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"encoding/json"
++	"fmt"
++	"io"
+ 	"net/url"
+ 	"os"
+ 	"path/filepath"
++	"regexp"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -22,6 +25,8 @@ const (
+ 
+ var diagnosticLogMu sync.Mutex
+ 
++var diagnosticSecretPattern = regexp.MustCompile(`(?i)(token|password|passwd|cookie|authorization|secret|auth_key|sign_token|sms_code|verify_code|phone|mobile|email|account|username)\s*[:=]\s*["']?([^\s,;&"']+)`)
++
+ // DiagnosticLogPath returns the local-only diagnostic log path.
+ // It prefers Fyne's application storage directory and has a safe fallback for
+ // tests or calls made before the Fyne application is initialized.
+@@ -74,6 +79,32 @@ func LogDiagnostic(event string, fields map[string]interface{}) {
+ 	_, _ = file.Write(data)
+ }
+ 
++// ExportDiagnosticLog writes a consistent snapshot of the diagnostic log.
++// The same mutex is shared with LogDiagnostic, so an exported JSONL file can
++// never end with a partially written event.
++func ExportDiagnosticLog(writer io.Writer) error {
++	if writer == nil {
++		return fmt.Errorf("导出目标不可用")
++	}
++
++	diagnosticLogMu.Lock()
++	defer diagnosticLogMu.Unlock()
++
++	file, err := os.Open(DiagnosticLogPath())
++	if err != nil {
++		if os.IsNotExist(err) {
++			return fmt.Errorf("暂无诊断日志，请先登录并执行一次操作")
++		}
++		return fmt.Errorf("打开诊断日志失败: %w", err)
++	}
++	defer file.Close()
++
++	if _, err := io.Copy(writer, file); err != nil {
++		return fmt.Errorf("写入导出文件失败: %w", err)
++	}
++	return nil
++}
++
+ // LogHTTPResponse records API response metadata and a bounded, sanitized body.
+ // Request headers are deliberately not accepted here, preventing credentials
+ // from entering the diagnostic log by accident.
+@@ -166,7 +197,7 @@ func sanitizeDiagnosticText(value string) string {
+ 	if err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
+ 		return SanitizeDiagnosticURL(value)
+ 	}
+-	return value
++	return diagnosticSecretPattern.ReplaceAllString(value, "$1=[REDACTED]")
+ }
+ 
+ func sensitiveDiagnosticField(key string) bool {
+@@ -179,8 +210,15 @@ func sensitiveDiagnosticField(key string) bool {
+ 		strings.Contains(lower, "secret") ||
+ 		strings.Contains(lower, "signature") ||
+ 		strings.Contains(lower, "sign_token") ||
++		strings.Contains(lower, "auth_key") ||
+ 		strings.Contains(lower, "verify_code") ||
++		strings.Contains(lower, "sms_code") ||
++		strings.Contains(lower, "phone") ||
++		strings.Contains(lower, "mobile") ||
++		strings.Contains(lower, "email") ||
+ 		lower == "code" ||
++		lower == "account" ||
++		lower == "username" ||
+ 		lower == "stuid" ||
+ 		lower == "user_id" ||
+ 		lower == "userid" ||
+diff --git a/utils/diagnostic_log_test.go b/utils/diagnostic_log_test.go
+index bc45269..303512d 100644
+--- a/utils/diagnostic_log_test.go
++++ b/utils/diagnostic_log_test.go
+@@ -1,7 +1,10 @@
+ package utils
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
++	"os"
++	"path/filepath"
+ 	"strings"
+ 	"testing"
+ )
+@@ -41,3 +44,66 @@ func TestSanitizeDiagnosticBodyPreservesCourseDataAndRedactsSecrets(t *testing.T
+ 		t.Fatalf("signed URL was not sanitized as expected: %s", got)
+ 	}
+ }
++
++func TestSanitizeDiagnosticBodyRedactsPlainTextSecrets(t *testing.T) {
++	input := []byte(`request failed: token=secret-token password:"secret-pass" phone=13800138000`)
++
++	sanitized, err := json.Marshal(SanitizeDiagnosticBody(input))
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := string(sanitized)
++	for _, secret := range []string{"secret-token", "secret-pass", "13800138000"} {
++		if strings.Contains(got, secret) {
++			t.Fatalf("plain text secret leaked: %s", got)
++		}
++	}
++}
++
++func TestSanitizeDiagnosticBodyRedactsAdditionalJSONFields(t *testing.T) {
++	input := []byte(`{"courseName":"保留课程名","auth_key":"secret-key","mobile":"13800138000","email":"user@example.test"}`)
++
++	sanitized, err := json.Marshal(SanitizeDiagnosticBody(input))
++	if err != nil {
++		t.Fatal(err)
++	}
++	got := string(sanitized)
++	if !strings.Contains(got, "保留课程名") {
++		t.Fatalf("useful course data was lost: %s", got)
++	}
++	for _, secret := range []string{"secret-key", "13800138000", "user@example.test"} {
++		if strings.Contains(got, secret) {
++			t.Fatalf("JSON secret leaked: %s", got)
++		}
++	}
++}
++
++func TestExportDiagnosticLog(t *testing.T) {
++	path := DiagnosticLogPath()
++	original, readErr := os.ReadFile(path)
++	hadOriginal := readErr == nil
++	t.Cleanup(func() {
++		if hadOriginal {
++			_ = os.MkdirAll(filepath.Dir(path), 0755)
++			_ = os.WriteFile(path, original, 0600)
++		} else {
++			_ = os.Remove(path)
++		}
++	})
++
++	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
++		t.Fatal(err)
++	}
++	want := []byte("{\"event\":\"one\"}\n{\"event\":\"two\"}\n")
++	if err := os.WriteFile(path, want, 0600); err != nil {
++		t.Fatal(err)
++	}
++
++	var output bytes.Buffer
++	if err := ExportDiagnosticLog(&output); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(output.Bytes(), want) {
++		t.Fatalf("export mismatch: got %q, want %q", output.Bytes(), want)
++	}
++}
