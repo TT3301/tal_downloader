@@ -35,3 +35,24 @@ func TestLectureUnmarshalPreservesIDsAndDisplayName(t *testing.T) {
 		t.Fatalf("TaskID = %q, want %q", got, want)
 	}
 }
+
+func TestLectureUsesServerPositionForLabelAndStableKey(t *testing.T) {
+	lecture := &Lecture{
+		LiveID:         42,
+		LiveTypeString: "SMALL_CLASS_MODE",
+		ClassID:        "transferred-class",
+		Position:       4,
+		ListIndex:      1,
+		DisplayName:    "第4讲",
+	}
+
+	if got, want := lecture.LessonNumber(), 4; got != want {
+		t.Fatalf("LessonNumber() = %d, want %d", got, want)
+	}
+	if got, want := lecture.Label(), "第4讲"; got != want {
+		t.Fatalf("Label() = %q, want %q", got, want)
+	}
+	if got, want := lecture.StableKey(), "42|transferred-class||SMALL_CLASS_MODE|4"; got != want {
+		t.Fatalf("StableKey() = %q, want %q", got, want)
+	}
+}

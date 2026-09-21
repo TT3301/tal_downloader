@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/itsHenry35/tal_downloader/config"
@@ -229,6 +230,17 @@ func (c *Client) GetCourseLectures(course *models.Course) ([]*models.Lecture, er
 	if len(merged) == 0 && len(failures) > 0 {
 		return nil, fmt.Errorf("获取课程课节失败：%s", strings.Join(failures, "; "))
 	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		left := merged[i].Position
+		right := merged[j].Position
+		if left > 0 && right > 0 {
+			return left < right
+		}
+		if left > 0 || right > 0 {
+			return left > 0
+		}
+		return false
+	})
 	for index, lecture := range merged {
 		lecture.ListIndex = index + 1
 	}

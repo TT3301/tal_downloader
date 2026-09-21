@@ -148,6 +148,65 @@ func TestGetCourseLecturesDoesNotMatchDifferentLessonsByPosition(t *testing.T) {
 	}
 }
 
+func TestGetCourseLecturesOrdersTransferredLessonsByServerPosition(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("page") != "1" {
+			fmt.Fprint(w, `[]`)
+			return
+		}
+		switch r.URL.Query().Get("stdCourseId") {
+		case "current":
+			fmt.Fprint(w, `[
+				{"liveId":104,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第4讲","pos":4},
+				{"liveId":105,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第5讲","pos":5}
+			]`)
+		case "previous-3":
+			fmt.Fprint(w, `[{"liveId":103,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第3讲","pos":3}]`)
+		case "previous-2":
+			fmt.Fprint(w, `[{"liveId":102,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第2讲","pos":2}]`)
+		case "previous-1":
+			fmt.Fprint(w, `[{"liveId":101,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第1讲","pos":1}]`)
+		default:
+			fmt.Fprint(w, `[]`)
+		}
+	}))
+	defer server.Close()
+
+	oldBase := config.CourseAPIBase
+	config.CourseAPIBase = server.URL
+	defer func() { config.CourseAPIBase = oldBase }()
+
+	course := &models.Course{CourseID: "current", SourceCourses: []models.CourseSource{
+		{CourseID: "current"},
+		{CourseID: "previous-3"},
+		{CourseID: "previous-2"},
+		{CourseID: "previous-1"},
+	}}
+	client := NewClient()
+	client.SetAuth("test-token", "student-1")
+
+	lectures, err := client.GetCourseLectures(course)
+	if err != nil {
+		t.Fatalf("GetCourseLectures: %v", err)
+	}
+	if got, want := len(lectures), 5; got != want {
+		t.Fatalf("lecture count = %d, want %d", got, want)
+	}
+	for index, lecture := range lectures {
+		want := index + 1
+		if got := lecture.Position; got != want {
+			t.Fatalf("lecture %d position = %d, want %d", index, got, want)
+		}
+		if got := lecture.ListIndex; got != want {
+			t.Fatalf("lecture %d ListIndex = %d, want %d", index, got, want)
+		}
+		if got := lecture.Label(); got != fmt.Sprintf("第%d讲", want) {
+			t.Fatalf("lecture %d label = %q", index, got)
+		}
+	}
+}
+
 func TestGetCourseVideoURLFallsBackToHistoricalEnrollment(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

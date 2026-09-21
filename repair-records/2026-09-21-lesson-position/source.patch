@@ -1,0 +1,206 @@
+diff --git a/api/course.go b/api/course.go
+index 7ebdea4..72533e7 100644
+--- a/api/course.go
++++ b/api/course.go
+@@ -4,6 +4,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"net/url"
++	"sort"
+ 	"strings"
+ 
+ 	"github.com/itsHenry35/tal_downloader/config"
+@@ -229,6 +230,17 @@ func (c *Client) GetCourseLectures(course *models.Course) ([]*models.Lecture, er
+ 	if len(merged) == 0 && len(failures) > 0 {
+ 		return nil, fmt.Errorf("获取课程课节失败：%s", strings.Join(failures, "; "))
+ 	}
++	sort.SliceStable(merged, func(i, j int) bool {
++		left := merged[i].Position
++		right := merged[j].Position
++		if left > 0 && right > 0 {
++			return left < right
++		}
++		if left > 0 || right > 0 {
++			return left > 0
++		}
++		return false
++	})
+ 	for index, lecture := range merged {
+ 		lecture.ListIndex = index + 1
+ 	}
+diff --git a/api/course_test.go b/api/course_test.go
+index d39b412..44c2b78 100644
+--- a/api/course_test.go
++++ b/api/course_test.go
+@@ -148,6 +148,65 @@ func TestGetCourseLecturesDoesNotMatchDifferentLessonsByPosition(t *testing.T) {
+ 	}
+ }
+ 
++func TestGetCourseLecturesOrdersTransferredLessonsByServerPosition(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		if r.URL.Query().Get("page") != "1" {
++			fmt.Fprint(w, `[]`)
++			return
++		}
++		switch r.URL.Query().Get("stdCourseId") {
++		case "current":
++			fmt.Fprint(w, `[
++				{"liveId":104,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第4讲","pos":4},
++				{"liveId":105,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第5讲","pos":5}
++			]`)
++		case "previous-3":
++			fmt.Fprint(w, `[{"liveId":103,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第3讲","pos":3}]`)
++		case "previous-2":
++			fmt.Fprint(w, `[{"liveId":102,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第2讲","pos":2}]`)
++		case "previous-1":
++			fmt.Fprint(w, `[{"liveId":101,"liveTypeString":"SMALL_CLASS_MODE","liveName":"第1讲","pos":1}]`)
++		default:
++			fmt.Fprint(w, `[]`)
++		}
++	}))
++	defer server.Close()
++
++	oldBase := config.CourseAPIBase
++	config.CourseAPIBase = server.URL
++	defer func() { config.CourseAPIBase = oldBase }()
++
++	course := &models.Course{CourseID: "current", SourceCourses: []models.CourseSource{
++		{CourseID: "current"},
++		{CourseID: "previous-3"},
++		{CourseID: "previous-2"},
++		{CourseID: "previous-1"},
++	}}
++	client := NewClient()
++	client.SetAuth("test-token", "student-1")
++
++	lectures, err := client.GetCourseLectures(course)
++	if err != nil {
++		t.Fatalf("GetCourseLectures: %v", err)
++	}
++	if got, want := len(lectures), 5; got != want {
++		t.Fatalf("lecture count = %d, want %d", got, want)
++	}
++	for index, lecture := range lectures {
++		want := index + 1
++		if got := lecture.Position; got != want {
++			t.Fatalf("lecture %d position = %d, want %d", index, got, want)
++		}
++		if got := lecture.ListIndex; got != want {
++			t.Fatalf("lecture %d ListIndex = %d, want %d", index, got, want)
++		}
++		if got := lecture.Label(); got != fmt.Sprintf("第%d讲", want) {
++			t.Fatalf("lecture %d label = %q", index, got)
++		}
++	}
++}
++
+ func TestGetCourseVideoURLFallsBackToHistoricalEnrollment(t *testing.T) {
+ 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+ 		w.Header().Set("Content-Type", "application/json")
+diff --git a/models/global.go b/models/global.go
+index f5f4fbb..5d690b2 100644
+--- a/models/global.go
++++ b/models/global.go
+@@ -59,6 +59,7 @@ func (course *Course) Sources() []CourseSource {
+ type Lecture struct {
+ 	LiveID         int           `json:"liveId"`
+ 	LiveTypeString string        `json:"liveTypeString"`
++	Position       int           `json:"pos"`
+ 	ClassID        string        `json:"stdClassId"`
+ 	SubjectID      string        `json:"stdSubject"`
+ 	LecturerID     string        `json:"lecturerId"`
+@@ -152,22 +153,45 @@ func (lecture *Lecture) StableKey() string {
+ 	if lecture == nil {
+ 		return ""
+ 	}
++	lessonNumber := lecture.LessonNumber()
+ 	return fmt.Sprintf("%d|%s|%s|%s|%d", lecture.LiveID, lecture.ClassID,
+-		lecture.SubjectID, lecture.LiveTypeString, lecture.ListIndex)
++		lecture.SubjectID, lecture.LiveTypeString, lessonNumber)
+ 
+ }
+ 
++// LessonNumber returns the server-defined course position whenever available.
++// ListIndex is only a compatibility fallback for older API responses that do
++// not include pos.
++func (lecture *Lecture) LessonNumber() int {
++	if lecture == nil {
++		return 0
++	}
++	if lecture.Position > 0 {
++		return lecture.Position
++	}
++	if lecture.ListIndex > 0 {
++		return lecture.ListIndex
++	}
++	return 0
++}
++
+ func (lecture *Lecture) Label() string {
+ 	if lecture == nil {
+ 		return "未知课节"
+ 	}
+ 
+-	index := lecture.ListIndex
+-	if index <= 0 {
+-		index = 1
++	lessonNumber := lecture.LessonNumber()
++	if lessonNumber <= 0 {
++		lessonNumber = 1
+ 	}
+-	label := fmt.Sprintf("第%d讲", index)
+-	if lecture.DisplayName != "" && lecture.DisplayName != label {
++	label := fmt.Sprintf("第%d讲", lessonNumber)
++	if lecture.DisplayName != "" {
++		if lecture.DisplayName == label {
++			return label
++		}
++		if strings.HasPrefix(lecture.DisplayName, label) {
++			return lecture.DisplayName
++		}
+ 		label += " - " + lecture.DisplayName
+ 	}
+ 	return label
+diff --git a/models/global_test.go b/models/global_test.go
+index 9b4b0d1..6093bc8 100644
+--- a/models/global_test.go
++++ b/models/global_test.go
+@@ -35,3 +35,24 @@ func TestLectureUnmarshalPreservesIDsAndDisplayName(t *testing.T) {
+ 		t.Fatalf("TaskID = %q, want %q", got, want)
+ 	}
+ }
++
++func TestLectureUsesServerPositionForLabelAndStableKey(t *testing.T) {
++	lecture := &Lecture{
++		LiveID:         42,
++		LiveTypeString: "SMALL_CLASS_MODE",
++		ClassID:        "transferred-class",
++		Position:       4,
++		ListIndex:      1,
++		DisplayName:    "第4讲",
++	}
++
++	if got, want := lecture.LessonNumber(), 4; got != want {
++		t.Fatalf("LessonNumber() = %d, want %d", got, want)
++	}
++	if got, want := lecture.Label(), "第4讲"; got != want {
++		t.Fatalf("Label() = %q, want %q", got, want)
++	}
++	if got, want := lecture.StableKey(), "42|transferred-class||SMALL_CLASS_MODE|4"; got != want {
++		t.Fatalf("StableKey() = %q, want %q", got, want)
++	}
++}
+diff --git a/ui/download_progress.go b/ui/download_progress.go
+index 1eed3e2..0829c9c 100644
+--- a/ui/download_progress.go
++++ b/ui/download_progress.go
+@@ -319,7 +319,7 @@ func (ds *DownloadProgressScreen) startDownloads() {
+ 					continue
+ 				}
+ 
+-				lectureNumber := lecture.ListIndex
++				lectureNumber := lecture.LessonNumber()
+ 				if lectureNumber <= 0 {
+ 					lectureNumber = j + 1
+ 				}
