@@ -19,6 +19,7 @@
 ## 修改文件
 
 - `.github/workflows/build.yml`
+- `.github/workflows/debug.yml`
 - `repair-records/2026-09-22-macos-arm-build/*`
 
 ## 回滚

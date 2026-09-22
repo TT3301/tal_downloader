@@ -6,8 +6,8 @@
 Ruby YAML 结构解析：PASS
 git diff --check：PASS
 go test ./...：PASS
-source.patch 反向应用安全检查：PASS
-临时 worktree 执行 ROLLBACK.sh：PASS；build.yml 恢复为基线状态，记录目录保留
+source.patch、debug.patch 反向应用安全检查：PASS
+临时 worktree 执行 ROLLBACK.sh：PASS；build.yml/debug.yml 恢复为基线状态，记录目录保留
 actionlint：未执行（本机未安装）
 ```
 
@@ -21,4 +21,6 @@ actionlint：未执行（本机未安装）
 
 ```text
 source.patch SHA-256：46fc2eabf0bf6ac4fae991cb8632697305e313dbcc82fe028f1f3259286cf48b
+debug.patch SHA-256：601da6d9e776e42257f2c7e21fa683d482e24d7316488134f039070ce8aa6bdb
+debug.patch SHA-256：待提交前重新计算
 ```
