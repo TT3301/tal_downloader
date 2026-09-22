@@ -237,10 +237,15 @@ jobs:
       - name: Install fyne
         run: go install fyne.io/tools/cmd/fyne@latest
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Java 17 for Android SDK
+        uses: actions/setup-java@v6
         with:
-          cmdline-tools-version: 12266719
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        # v4 no longer requests Google's removed legacy `tools` package.
+        uses: android-actions/setup-android@v4
 
       - name: Update version info
         run: |
