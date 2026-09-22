@@ -7,11 +7,16 @@
 
 ## 原因
 
-最近一次 Android job 的日志显示，`android-actions/setup-android@v3` 调用 `sdkmanager` 时报告：当前命令行工具要求 JDK 17 或更高版本，但 Runner 检测到 Java 11.0.32。
+最近一次 Android job 暴露了两层兼容性问题：`android-actions/setup-android@v3` 调用 `sdkmanager` 时先报告 Runner 使用 Java 11.0.32，而当前命令行工具要求 JDK 17 或更高版本；切换到 JDK 17 后，旧版 action 又请求已被 Google 移除的 `tools` 包。
 
 ## 修改
 
-在正式 Build 和 Debug 工作流的 Android job 中，在 Android SDK 初始化前增加：
+在正式 Build 和 Debug 工作流的 Android job 中：
+
+- 在 Android SDK 初始化前使用 Temurin JDK 17。
+- 升级 `android-actions/setup-android` 到 v4，使用当前默认的命令行工具和 `platform-tools`，移除过时的 `tools` 包配置。
+
+JDK 配置为：
 
 ```yaml
 - uses: actions/setup-java@v6

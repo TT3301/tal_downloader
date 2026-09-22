@@ -217,9 +217,8 @@ jobs:
           java-version: '17'
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 12266719
+        # v4 no longer requests Google's removed legacy `tools` package.
+        uses: android-actions/setup-android@v4
 
       - name: Update version info
         run: |
