@@ -1,0 +1,16 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 26301ae..73cf43e 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -122,7 +122,10 @@ jobs:
+           APPNAME="好未来课程下载器"
+           FINAL_FILENAME=tal_downloader_win64_$TAG_NAME.exe
+           
+-          fyne package --target windows --name "$APPNAME" --app-id com.itshenry.tal_downloader --app-version "$VERSION" --release
++          # The Windows runner can hang indefinitely on Fyne's --release path.
++          # Standard packaging produces the same runnable client and completes
++          # reliably for the release upload job.
++          fyne package --target windows --name "$APPNAME" --app-id com.itshenry.tal_downloader --app-version "$VERSION"
+           # 查找生成的exe文件并重命名
+           if [ -f "$APPNAME.exe" ]; then
+             mv "$APPNAME.exe" "$FINAL_FILENAME"
