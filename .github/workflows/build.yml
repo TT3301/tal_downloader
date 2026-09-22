@@ -68,6 +68,8 @@ jobs:
           mv $APPNAME $FINAL_FILENAME
 
       - name: Release Linux
+        # Only formal releases or an explicit manual build may touch Release assets.
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: svenstaro/upload-release-action@v2
         with:
           tag: ${{ github.event.release.tag_name || inputs.version }}
@@ -141,6 +143,8 @@ jobs:
           fi
 
       - name: Release Windows
+        # Only formal releases or an explicit manual build may touch Release assets.
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: svenstaro/upload-release-action@v2
         with:
           tag: ${{ github.event.release.tag_name || inputs.version }}
@@ -210,6 +214,8 @@ jobs:
           zip -r -X $FINAL_FILENAME.zip $FINAL_FILENAME.app
 
       - name: Release macOS ARM64
+        # Only formal releases or an explicit manual build may touch Release assets.
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: svenstaro/upload-release-action@v2
         with:
           tag: ${{ github.event.release.tag_name || inputs.version }}
@@ -308,6 +314,8 @@ jobs:
           fi
 
       - name: Release Android ARM64
+        # Only formal releases or an explicit manual build may touch Release assets.
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: svenstaro/upload-release-action@v2
         with:
           tag: ${{ github.event.release.tag_name || inputs.version }}
@@ -316,6 +324,8 @@ jobs:
           file: tal_downloader_android_arm64_${{ github.event.release.tag_name || inputs.version }}.apk
 
       - name: Release Android ARM
+        # Only formal releases or an explicit manual build may touch Release assets.
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: svenstaro/upload-release-action@v2
         with:
           tag: ${{ github.event.release.tag_name || inputs.version }}
