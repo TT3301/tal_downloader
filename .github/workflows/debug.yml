@@ -140,8 +140,9 @@ jobs:
           path: |
             tal_downloader_win64_*.exe
 
-  Build_MacOS_ARM64_Android:
-    runs-on: macos-latest
+  Build_MacOS_ARM64:
+    # macos-15 is the GitHub-hosted arm64 runner label.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
 
@@ -152,11 +153,6 @@ jobs:
 
       - name: Install fyne
         run: go install fyne.io/tools/cmd/fyne@latest
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 12266719
 
       - name: Update version info
         run: |
@@ -193,6 +189,49 @@ jobs:
           mv "$APPNAME.app" "$FINAL_FILENAME.app"
           zip -r -X $FINAL_FILENAME.zip $FINAL_FILENAME.app
 
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "MacOS-ARM64-build"
+          path: |
+            tal_downloader_macos_arm64_*.zip
+
+  Build_Android:
+    # Keep Android failures from preventing desktop debug artifacts.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.20'
+
+      - name: Install fyne
+        run: go install fyne.io/tools/cmd/fyne@latest
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 12266719
+
+      - name: Update version info
+        run: |
+          SHORT_COMMIT_ID=${GITHUB_SHA::7}
+          BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          if [ "$GITHUB_EVENT_NAME" == "pull_request" ]; then
+            VERSION="[PR]$SHORT_COMMIT_ID"
+          else
+            VERSION="[CI]$SHORT_COMMIT_ID"
+          fi
+
+          sed -i "s/const Version = \"Debug\"/const Version = \"$VERSION\"/" constants/constants.go
+          sed -i "s/const BuildTime = \"Unknown\"/const BuildTime = \"$BUILD_TIME\"/" constants/constants.go
+
+          echo "Updated constants.go:"
+          cat constants/constants.go
+
       - name: Build Android ARM64
         env:
           CGO_ENABLED: 1
@@ -227,12 +266,6 @@ jobs:
           fyne package --target android/arm --name "$APPNAME" --app-id com.itshenry.tal_downloader
           mv "$FILENAME.apk" "$FINAL_FILENAME.apk"
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: "MacOS-ARM64-build"
-          path: |
-            tal_downloader_macos_arm64_*.zip
       - name: Upload Android Arm64 Artifacts
         uses: actions/upload-artifact@v4
         with:

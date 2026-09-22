@@ -155,8 +155,9 @@ jobs:
           path: |
             tal_downloader_win64_${{ github.event.release.tag_name || inputs.version }}.exe
 
-  Build_MacOS_ARM64_Android:
-    runs-on: macos-latest
+  Build_MacOS_ARM64:
+    # macos-15 is the GitHub-hosted arm64 runner label.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
 
@@ -167,11 +168,6 @@ jobs:
 
       - name: Install fyne
         run: go install fyne.io/tools/cmd/fyne@latest
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 12266719
 
       - name: Update version info
         run: |
@@ -196,7 +192,9 @@ jobs:
           APPNAME="好未来课程下载器"
           FINAL_FILENAME=tal_downloader_macos_arm64_$TAG_NAME
           
-          fyne package --target darwin --name "$APPNAME" --app-id com.itshenry.tal_downloader --app-version "$VERSION" --release
+          # Keep this job independent from Android SDK setup and Fyne's
+          # occasionally hanging --release path.
+          fyne package --target darwin --name "$APPNAME" --app-id com.itshenry.tal_downloader --app-version "$VERSION"
           if [ -d "$APPNAME.app" ]; then
             mv "$APPNAME.app" "$FINAL_FILENAME.app"
           else
@@ -210,6 +208,51 @@ jobs:
             fi
           fi
           zip -r -X $FINAL_FILENAME.zip $FINAL_FILENAME.app
+
+      - name: Release macOS ARM64
+        uses: svenstaro/upload-release-action@v2
+        with:
+          tag: ${{ github.event.release.tag_name || inputs.version }}
+          release_name: ${{ github.event.release.tag_name || inputs.version }}
+          overwrite: true
+          file: tal_downloader_macos_arm64_${{ github.event.release.tag_name || inputs.version }}.zip
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: "MacOS-ARM64-build"
+          path: tal_downloader_macos_arm64_${{ github.event.release.tag_name || inputs.version }}.zip
+
+  Build_Android:
+    # Keep Android failures from preventing desktop assets from publishing.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.20'
+
+      - name: Install fyne
+        run: go install fyne.io/tools/cmd/fyne@latest
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 12266719
+
+      - name: Update version info
+        run: |
+          TAG_NAME="${{ github.event.release.tag_name || inputs.version }}"
+          VERSION="${TAG_NAME#v}"
+          BUILD_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          sed -i "s/const Version = \"Debug\"/const Version = \"$VERSION\"/" constants/constants.go
+          sed -i "s/const BuildTime = \"Unknown\"/const BuildTime = \"$BUILD_TIME\"/" constants/constants.go
+
+          echo "Updated constants.go:"
+          cat constants/constants.go
 
       - name: Build Android ARM64
         env:
@@ -259,14 +302,6 @@ jobs:
             fi
           fi
 
-      - name: Release macOS ARM64
-        uses: svenstaro/upload-release-action@v2
-        with:
-          tag: ${{ github.event.release.tag_name || inputs.version }}
-          release_name: ${{ github.event.release.tag_name || inputs.version }}
-          overwrite: true
-          file: tal_downloader_macos_arm64_${{ github.event.release.tag_name || inputs.version }}.zip
-
       - name: Release Android ARM64
         uses: svenstaro/upload-release-action@v2
         with:
@@ -286,9 +321,8 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: "MacOS-ARM64-Android-build"
+          name: "Android-build"
           path: |
-            tal_downloader_macos_arm64_${{ github.event.release.tag_name || inputs.version }}.zip
             tal_downloader_android_arm64_${{ github.event.release.tag_name || inputs.version }}.apk
             tal_downloader_android_arm_${{ github.event.release.tag_name || inputs.version }}.apk
 
